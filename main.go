@@ -357,7 +357,7 @@ func verifyOllamaAPI(ollamaURL, model string) error {
 func verifyAnthropicAPI(apiKey string) error {
 	// Create a minimal test request
 	reqBody := AnthropicRequest{
-		Model:     "claude-3-5-sonnet-20241022",
+		Model:     "claude-sonnet-4-5-20250929",
 		MaxTokens: 1,
 		Messages: []Message{
 			{
@@ -541,7 +541,7 @@ func describeImage(imagePath string, apiKey string) (string, error) {
 
 	// Create API request
 	reqBody := AnthropicRequest{
-		Model:     "claude-3-5-sonnet-20241022",
+		Model:     "claude-sonnet-4-5-20250929",
 		MaxTokens: 1024,
 		Messages: []Message{
 			{
