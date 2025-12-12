@@ -57,6 +57,23 @@ export OLLAMA_EMBEDDING_MODEL=mxbai-embed-large
 ./lensdb -search "dogs playing"
 ```
 
+### Web Interface
+
+Start a web server to search your images through a browser interface:
+
+```bash
+# Start web interface on default port 8080
+./lensdb -web
+
+# Use custom port
+./lensdb -web -port 3000
+
+# With custom database and Ollama configuration
+./lensdb -web -port 3000 -db custom.db -ollama-url http://192.168.1.100:11434
+```
+
+Then open your browser to `http://localhost:8080` (or your specified port) to search interactively.
+
 ## Flags
 
 Command-line flags override environment variables:
@@ -66,6 +83,8 @@ Command-line flags override environment variables:
 - `-ollama-url`: Ollama server URL (env: `OLLAMA_URL`, default: `http://localhost:11434`)
 - `-embedding-model`: Ollama embedding model (env: `OLLAMA_EMBEDDING_MODEL`, default: `nomic-embed-text`)
 - `-search`: Search query for semantic image search
+- `-web`: Start web interface for interactive searching
+- `-port`: Port for web interface (default: `8080`)
 
 ## Supported Image Formats
 
@@ -76,6 +95,7 @@ Command-line flags override environment variables:
 
 ## Features
 
+- **Web Interface**: Interactive browser-based search interface for exploring your image collection with real-time semantic search results.
 - **Semantic Search**: Search your image collection using natural language queries powered by Ollama embeddings and sqlite-vec. Find images based on their content, not just filenames.
 - **Smart Duplicate Detection**: Images already in the database are automatically skipped, avoiding redundant API calls and saving costs. Re-run the tool on the same folder anytime to process only new images.
 - **Automatic Image Resizing**: Large images are automatically resized to 1000px on their longest side before being sent to the API. This ensures images stay under the 5MB API limit while maintaining quality.
@@ -163,3 +183,18 @@ This will:
 ```bash
 sqlite3 ~/.lensdb.db "SELECT filename, description FROM image_descriptions;"
 ```
+
+## Dependencies
+
+LensDB uses the following Go packages:
+
+- **github.com/mattn/go-sqlite3** (v1.14.32): SQLite database driver
+- **github.com/asg017/sqlite-vec-go-bindings** (v0.1.6): SQLite vector search extension
+- **golang.org/x/image** (v0.34.0): Image processing and format support (including WebP)
+
+### System Requirements
+
+- Go 1.24.0 or higher
+- CGO enabled (required for SQLite compilation)
+- Ollama running locally or on remote server
+- Anthropic API key for image description generation
