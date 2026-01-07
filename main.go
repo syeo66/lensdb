@@ -89,6 +89,7 @@ func main() {
 	var searchQuery string
 	var webMode bool
 	var port int
+	var similarImage string
 
 	// Get default database path in home directory
 	homeDir, err := os.UserHomeDir()
@@ -104,6 +105,7 @@ func main() {
 	flag.StringVar(&searchQuery, "search", "", "Search for images by description (semantic search)")
 	flag.BoolVar(&webMode, "web", false, "Start web interface for searching images")
 	flag.IntVar(&port, "port", 8080, "Port for web interface (default: 8080)")
+	flag.StringVar(&similarImage, "similar", "", "Find images similar to the given image path")
 	flag.Parse()
 
 	// Get Ollama URL from environment if not provided
@@ -162,10 +164,20 @@ func main() {
 		return
 	}
 
+	// Handle similar image mode
+	if similarImage != "" {
+		err = findSimilarImages(db, similarImage)
+		if err != nil {
+			log.Fatalf("Failed to find similar images: %v", err)
+		}
+		return
+	}
+
 	// Handle process mode
 	if len(flag.Args()) == 0 {
 		log.Fatal("Usage: lensdb <folder-path> [options]\n" +
 			"  or:  lensdb -search \"query\" [options]\n" +
+			"  or:  lensdb -similar \"/path/to/image.jpg\" [options]\n" +
 			"  or:  lensdb -web [options]\n\n" +
 			"Options:\n" +
 			"  -db              Path to SQLite database file\n" +
@@ -173,6 +185,7 @@ func main() {
 			"  -ollama-url      Ollama server URL (or set OLLAMA_URL env var)\n" +
 			"  -embedding-model Ollama embedding model (or set OLLAMA_EMBEDDING_MODEL env var)\n" +
 			"  -search          Search for images by description\n" +
+			"  -similar         Find images similar to the specified image\n" +
 			"  -web             Start web interface for searching images\n" +
 			"  -port            Port for web interface (default: 8080)\n\n" +
 			"Environment Variables:\n" +
@@ -723,6 +736,74 @@ func searchImages(db *sql.DB, query, ollamaURL, embeddingModel string) error {
 	return rows.Err()
 }
 
+// findSimilarImages performs similarity search based on an existing image's embedding
+func findSimilarImages(db *sql.DB, imagePath string) error {
+	// Convert to absolute path for DB lookup
+	absPath, err := filepath.Abs(imagePath)
+	if err != nil {
+		return fmt.Errorf("invalid image path: %w", err)
+	}
+
+	// Query database for embedding
+	var embeddingBlob []byte
+	err = db.QueryRow("SELECT embedding FROM image_descriptions WHERE path = ?", absPath).Scan(&embeddingBlob)
+	if err == sql.ErrNoRows {
+		return fmt.Errorf("image not found in database: %s\nRun lensdb on this image first to add it to the database", absPath)
+	}
+	if err != nil {
+		return fmt.Errorf("failed to retrieve embedding: %w", err)
+	}
+
+	// Execute vector search with source exclusion
+	searchSQL := `
+		SELECT
+			img.filename,
+			img.foldername,
+			img.path,
+			img.description,
+			vec.distance
+		FROM vec_descriptions vec
+		INNER JOIN image_descriptions img ON vec.rowid = img.id
+		WHERE vec.embedding MATCH ? AND k = 11 AND img.path != ?
+		ORDER BY vec.distance
+	`
+
+	rows, err := db.Query(searchSQL, embeddingBlob, absPath)
+	if err != nil {
+		return fmt.Errorf("failed to search for similar images: %w", err)
+	}
+	defer rows.Close()
+
+	// Print results
+	fmt.Printf("\nImages similar to: %s\n\n", filepath.Base(absPath))
+
+	count := 0
+	for rows.Next() {
+		var result SearchResult
+		err = rows.Scan(&result.Filename, &result.Foldername, &result.Path, &result.Description, &result.Distance)
+		if err != nil {
+			log.Printf("Error scanning result: %v", err)
+			continue
+		}
+
+		fmt.Printf("File: %s\n", result.Filename)
+		fmt.Printf("Folder: %s\n", result.Foldername)
+		fmt.Printf("Path: %s\n", result.Path)
+		fmt.Printf("Description: %s\n", result.Description)
+		fmt.Printf("Distance: %.4f\n", result.Distance)
+		fmt.Println("---")
+		count++
+	}
+
+	if count == 0 {
+		fmt.Println("No similar images found in database.")
+	} else {
+		fmt.Printf("\nFound %d similar images\n", count)
+	}
+
+	return rows.Err()
+}
+
 // searchImagesForWeb performs semantic search and returns results instead of printing them
 func searchImagesForWeb(db *sql.DB, query, ollamaURL, embeddingModel string) ([]SearchResult, error) {
 	// Generate embedding for the query
@@ -779,10 +860,64 @@ func searchImagesForWeb(db *sql.DB, query, ollamaURL, embeddingModel string) ([]
 	return results, rows.Err()
 }
 
+// findSimilarImagesForWeb performs similarity search for web interface and returns results
+func findSimilarImagesForWeb(db *sql.DB, imagePath string) ([]SearchResult, error) {
+	// Convert to absolute path for DB lookup
+	absPath, err := filepath.Abs(imagePath)
+	if err != nil {
+		return nil, fmt.Errorf("invalid image path: %w", err)
+	}
+
+	// Query database for embedding
+	var embeddingBlob []byte
+	err = db.QueryRow("SELECT embedding FROM image_descriptions WHERE path = ?", absPath).Scan(&embeddingBlob)
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("image not found in database")
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to retrieve embedding: %w", err)
+	}
+
+	// Execute vector search with source exclusion
+	searchSQL := `
+		SELECT
+			img.filename,
+			img.foldername,
+			img.path,
+			img.description,
+			vec.distance
+		FROM vec_descriptions vec
+		INNER JOIN image_descriptions img ON vec.rowid = img.id
+		WHERE vec.embedding MATCH ? AND k = 26 AND img.path != ?
+		ORDER BY vec.distance
+	`
+
+	rows, err := db.Query(searchSQL, embeddingBlob, absPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to search for similar images: %w", err)
+	}
+	defer rows.Close()
+
+	// Build results
+	var results []SearchResult
+	for rows.Next() {
+		var result SearchResult
+		err = rows.Scan(&result.Filename, &result.Foldername, &result.Path, &result.Description, &result.Distance)
+		if err != nil {
+			log.Printf("Error scanning result: %v", err)
+			continue
+		}
+		results = append(results, result)
+	}
+
+	return results, rows.Err()
+}
+
 // startWebServer starts the HTTP server for web interface
 func startWebServer(db *sql.DB, ollamaURL, embeddingModel string, port int) {
 	http.HandleFunc("/", handleIndex)
 	http.HandleFunc("/search", makeSearchHandler(db, ollamaURL, embeddingModel))
+	http.HandleFunc("/similar", makeSimilarHandler(db, ollamaURL, embeddingModel))
 	http.HandleFunc("/image/", makeImageHandler())
 
 	addr := fmt.Sprintf(":%d", port)
@@ -944,6 +1079,24 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
         .htmx-request.search-button {
             opacity: 0.7;
         }
+        .similar-button {
+            margin-left: 10px;
+            padding: 5px 15px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 15px;
+            font-size: 0.85em;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s;
+        }
+        .similar-button:hover {
+            transform: scale(1.05);
+        }
+        .similar-button:active {
+            transform: scale(0.95);
+        }
     </style>
 </head>
 <body>
@@ -1021,7 +1174,10 @@ func makeSearchHandler(db *sql.DB, ollamaURL, embeddingModel string) http.Handle
 					<div class="result-filename">%s</div>
 					<div class="result-path">%s</div>
 					<div class="result-description">%s</div>
-					<span class="result-distance">distance: %.4f</span>
+					<div>
+						<span class="result-distance">distance: %.4f</span>
+						<button class="similar-button" hx-post="/similar" hx-target="#results" hx-vals='{"path": "%s"}'>Find Similar</button>
+					</div>
 				</div>
 			</div>`,
 				encodedPath,
@@ -1030,8 +1186,72 @@ func makeSearchHandler(db *sql.DB, ollamaURL, embeddingModel string) http.Handle
 				template.HTMLEscapeString(result.Path),
 				template.HTMLEscapeString(result.Description),
 				result.Distance,
+				template.JSEscapeString(result.Path),
 			)
 		}
+		fmt.Fprint(w, `</div>`)
+	}
+}
+
+// makeSimilarHandler creates a handler for finding similar images
+func makeSimilarHandler(db *sql.DB, ollamaURL, embeddingModel string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		imagePath := r.FormValue("path")
+		if imagePath == "" {
+			http.Error(w, "Path parameter required", http.StatusBadRequest)
+			return
+		}
+
+		results, err := findSimilarImagesForWeb(db, imagePath)
+		if err != nil {
+			log.Printf("Similar search error: %v", err)
+			if err.Error() == "image not found in database" {
+				fmt.Fprint(w, `<div class="no-results">This image is not in the database.</div>`)
+			} else {
+				fmt.Fprintf(w, `<div class="no-results">Error: %s</div>`, template.HTMLEscapeString(err.Error()))
+			}
+			return
+		}
+
+		if len(results) == 0 {
+			fmt.Fprint(w, `<div class="no-results">No similar images found.</div>`)
+			return
+		}
+
+		// Render results using same HTML structure as search
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, `<div class="results">`)
+
+		for _, result := range results {
+			encodedPath := url.QueryEscape(result.Path)
+			fmt.Fprintf(w, `
+			<div class="result-card">
+				<img src="/image/?path=%s" alt="%s" class="result-image" loading="lazy">
+				<div class="result-content">
+					<div class="result-filename">%s</div>
+					<div class="result-path">%s</div>
+					<div class="result-description">%s</div>
+					<div>
+						<span class="result-distance">distance: %.4f</span>
+						<button class="similar-button" hx-post="/similar" hx-target="#results" hx-vals='{"path": "%s"}'>Find Similar</button>
+					</div>
+				</div>
+			</div>`,
+				encodedPath,
+				template.HTMLEscapeString(result.Filename),
+				template.HTMLEscapeString(result.Filename),
+				template.HTMLEscapeString(result.Path),
+				template.HTMLEscapeString(result.Description),
+				result.Distance,
+				template.JSEscapeString(result.Path),
+			)
+		}
+
 		fmt.Fprint(w, `</div>`)
 	}
 }
