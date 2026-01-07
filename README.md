@@ -57,6 +57,21 @@ export OLLAMA_EMBEDDING_MODEL=mxbai-embed-large
 ./lensdb -search "dogs playing"
 ```
 
+### Finding Similar Images
+
+Find images similar to a specific image in your database:
+
+```bash
+# Find images similar to a specific image
+./lensdb -similar /path/to/image.jpg
+
+# With custom database
+./lensdb -similar /path/to/image.jpg -db custom.db
+
+# Note: The image must already be in the database
+# Run lensdb on the folder containing the image first if it's not indexed yet
+```
+
 ### Web Interface
 
 Start a web server to search your images through a browser interface:
@@ -72,7 +87,7 @@ Start a web server to search your images through a browser interface:
 ./lensdb -web -port 3000 -db custom.db -ollama-url http://192.168.1.100:11434
 ```
 
-Then open your browser to `http://localhost:8080` (or your specified port) to search interactively.
+Then open your browser to `http://localhost:8080` (or your specified port) to search interactively. The web interface includes "Find Similar" buttons for each search result.
 
 ## Flags
 
@@ -83,6 +98,7 @@ Command-line flags override environment variables:
 - `-ollama-url`: Ollama server URL (env: `OLLAMA_URL`, default: `http://localhost:11434`)
 - `-embedding-model`: Ollama embedding model (env: `OLLAMA_EMBEDDING_MODEL`, default: `nomic-embed-text`)
 - `-search`: Search query for semantic image search
+- `-similar`: Find images similar to the specified image path
 - `-web`: Start web interface for interactive searching
 - `-port`: Port for web interface (default: `8080`)
 
@@ -95,8 +111,9 @@ Command-line flags override environment variables:
 
 ## Features
 
-- **Web Interface**: Interactive browser-based search interface for exploring your image collection with real-time semantic search results.
+- **Web Interface**: Interactive browser-based search interface for exploring your image collection with real-time semantic search results and "Find Similar" functionality.
 - **Semantic Search**: Search your image collection using natural language queries powered by Ollama embeddings and sqlite-vec. Find images based on their content, not just filenames.
+- **Find Similar Images**: Discover images visually similar to a given image by comparing their embeddings. Works in both CLI and web interface modes.
 - **Smart Duplicate Detection**: Images already in the database are automatically skipped, avoiding redundant API calls and saving costs. Re-run the tool on the same folder anytime to process only new images.
 - **Automatic Image Resizing**: Large images are automatically resized to 1000px on their longest side before being sent to the API. This ensures images stay under the 5MB API limit while maintaining quality.
 - **High-Quality Processing**: Uses Catmull-Rom interpolation for smooth, professional-looking resized images.
