@@ -41,6 +41,7 @@ type SearchResult struct {
 	Path        string
 	Description string
 	Distance    float64
+	Thumbnail   string // base64-encoded JPEG for data URL
 }
 
 type AnthropicRequest struct {
@@ -241,6 +242,7 @@ func initDatabase(dbPath string) (*sql.DB, error) {
 		path TEXT NOT NULL UNIQUE,
 		description TEXT NOT NULL,
 		embedding BLOB,
+		thumbnail BLOB,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 	`
@@ -249,6 +251,9 @@ func initDatabase(dbPath string) (*sql.DB, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// Migrate existing databases: add thumbnail column if missing
+	_, _ = db.Exec(`ALTER TABLE image_descriptions ADD COLUMN thumbnail BLOB`)
 
 	// Create virtual table for vector search if not exists
 	createVecTableSQL := `
@@ -462,7 +467,12 @@ func processFolder(folderPath string, db *sql.DB, apiKey, ollamaURL, embeddingMo
 			return fmt.Errorf("failed to generate embedding for %s - Ollama API error: %w", path, err)
 		}
 
-		err = storeImageDescription(db, path, description, embedding)
+		thumbnail, err := generateThumbnail(path)
+		if err != nil {
+			log.Printf("Warning: failed to generate thumbnail for %s: %v", path, err)
+		}
+
+		err = storeImageDescription(db, path, description, embedding, thumbnail)
 		if err != nil {
 			return fmt.Errorf("failed to store description for %s: %w", path, err)
 		}
@@ -497,6 +507,28 @@ func resizeImage(img image.Image, maxSize int) image.Image {
 	dst := image.NewRGBA(image.Rect(0, 0, newWidth, newHeight))
 	draw.CatmullRom.Scale(dst, dst.Bounds(), img, img.Bounds(), draw.Over, nil)
 	return dst
+}
+
+// generateThumbnail creates a 200px (longest side) JPEG thumbnail for storage
+func generateThumbnail(imagePath string) ([]byte, error) {
+	file, err := os.Open(imagePath)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	img, _, err := image.Decode(file)
+	if err != nil {
+		return nil, err
+	}
+
+	img = resizeImage(img, 200)
+
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 80}); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
 func describeImage(imagePath string, apiKey string) (string, error) {
@@ -622,7 +654,7 @@ func describeImage(imagePath string, apiKey string) (string, error) {
 	return apiResp.Content[0].Text, nil
 }
 
-func storeImageDescription(db *sql.DB, imagePath string, description string, embedding []float32) error {
+func storeImageDescription(db *sql.DB, imagePath string, description string, embedding []float32, thumbnail []byte) error {
 	filename := filepath.Base(imagePath)
 	foldername := filepath.Base(filepath.Dir(imagePath))
 	absPath, err := filepath.Abs(imagePath)
@@ -645,11 +677,11 @@ func storeImageDescription(db *sql.DB, imagePath string, description string, emb
 
 	// Insert or replace in main table
 	insertSQL := `
-	INSERT OR REPLACE INTO image_descriptions (filename, foldername, path, description, embedding)
-	VALUES (?, ?, ?, ?, ?)
+	INSERT OR REPLACE INTO image_descriptions (filename, foldername, path, description, embedding, thumbnail)
+	VALUES (?, ?, ?, ?, ?, ?)
 	`
 
-	result, err := tx.Exec(insertSQL, filename, foldername, absPath, description, embeddingBlob)
+	result, err := tx.Exec(insertSQL, filename, foldername, absPath, description, embeddingBlob, thumbnail)
 	if err != nil {
 		return err
 	}
@@ -825,7 +857,8 @@ func searchImagesForWeb(db *sql.DB, query, ollamaURL, embeddingModel string) ([]
 		img.foldername,
 		img.path,
 		img.description,
-		vec.distance
+		vec.distance,
+		img.thumbnail
 	FROM vec_descriptions vec
 	INNER JOIN image_descriptions img ON vec.rowid = img.id
 	WHERE vec.embedding MATCH ? AND k = ?
@@ -842,19 +875,24 @@ func searchImagesForWeb(db *sql.DB, query, ollamaURL, embeddingModel string) ([]
 	for rows.Next() {
 		var filename, foldername, path, description string
 		var distance float64
+		var thumbnailBlob []byte
 
-		err := rows.Scan(&filename, &foldername, &path, &description, &distance)
+		err := rows.Scan(&filename, &foldername, &path, &description, &distance, &thumbnailBlob)
 		if err != nil {
 			return nil, err
 		}
 
-		results = append(results, SearchResult{
+		result := SearchResult{
 			Filename:    filename,
 			Foldername:  foldername,
 			Path:        path,
 			Description: description,
 			Distance:    distance,
-		})
+		}
+		if len(thumbnailBlob) > 0 {
+			result.Thumbnail = base64.StdEncoding.EncodeToString(thumbnailBlob)
+		}
+		results = append(results, result)
 	}
 
 	return results, rows.Err()
@@ -885,7 +923,8 @@ func findSimilarImagesForWeb(db *sql.DB, imagePath string) ([]SearchResult, erro
 			img.foldername,
 			img.path,
 			img.description,
-			vec.distance
+			vec.distance,
+			img.thumbnail
 		FROM vec_descriptions vec
 		INNER JOIN image_descriptions img ON vec.rowid = img.id
 		WHERE vec.embedding MATCH ? AND k = 26 AND img.path != ?
@@ -902,10 +941,14 @@ func findSimilarImagesForWeb(db *sql.DB, imagePath string) ([]SearchResult, erro
 	var results []SearchResult
 	for rows.Next() {
 		var result SearchResult
-		err = rows.Scan(&result.Filename, &result.Foldername, &result.Path, &result.Description, &result.Distance)
+		var thumbnailBlob []byte
+		err = rows.Scan(&result.Filename, &result.Foldername, &result.Path, &result.Description, &result.Distance, &thumbnailBlob)
 		if err != nil {
 			log.Printf("Error scanning result: %v", err)
 			continue
+		}
+		if len(thumbnailBlob) > 0 {
+			result.Thumbnail = base64.StdEncoding.EncodeToString(thumbnailBlob)
 		}
 		results = append(results, result)
 	}
@@ -1012,29 +1055,28 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
             font-size: 1.2em;
         }
         .results {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
-            gap: 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
         }
         .result-card {
             background: white;
             border-radius: 12px;
             overflow: hidden;
             box-shadow: 0 5px 15px rgba(0,0,0,0.2);
-            transition: transform 0.3s, box-shadow 0.3s;
-        }
-        .result-card:hover {
-            transform: translateY(-5px);
-            box-shadow: 0 10px 25px rgba(0,0,0,0.3);
+            display: flex;
+            flex-direction: row;
+            align-items: flex-start;
         }
         .result-image {
-            width: 100%;
-            height: 200px;
-            object-fit: cover;
-            background: #f0f0f0;
+            display: block;
+            flex-shrink: 0;
+            margin: 8px;
+            border: 4px solid white;
+            outline: 1px solid #ccc;
         }
         .result-content {
-            padding: 20px;
+            padding: 15px 20px;
         }
         .result-filename {
             font-weight: 600;
@@ -1166,10 +1208,13 @@ func makeSearchHandler(db *sql.DB, ollamaURL, embeddingModel string) http.Handle
 		w.Header().Set("Content-Type", "text/html")
 		fmt.Fprint(w, `<div class="results">`)
 		for _, result := range results {
-			encodedPath := url.QueryEscape(result.Path)
+			imgSrc := "/image/?path=" + url.QueryEscape(result.Path)
+			if result.Thumbnail != "" {
+				imgSrc = "data:image/jpeg;base64," + result.Thumbnail
+			}
 			fmt.Fprintf(w, `
 			<div class="result-card">
-				<img src="/image/?path=%s" alt="%s" class="result-image" loading="lazy">
+				<img src="%s" alt="%s" class="result-image" loading="lazy">
 				<div class="result-content">
 					<div class="result-filename">%s</div>
 					<div class="result-path">%s</div>
@@ -1180,7 +1225,7 @@ func makeSearchHandler(db *sql.DB, ollamaURL, embeddingModel string) http.Handle
 					</div>
 				</div>
 			</div>`,
-				encodedPath,
+				imgSrc,
 				template.HTMLEscapeString(result.Filename),
 				template.HTMLEscapeString(result.Filename),
 				template.HTMLEscapeString(result.Path),
@@ -1228,10 +1273,13 @@ func makeSimilarHandler(db *sql.DB, ollamaURL, embeddingModel string) http.Handl
 		fmt.Fprint(w, `<div class="results">`)
 
 		for _, result := range results {
-			encodedPath := url.QueryEscape(result.Path)
+			imgSrc := "/image/?path=" + url.QueryEscape(result.Path)
+			if result.Thumbnail != "" {
+				imgSrc = "data:image/jpeg;base64," + result.Thumbnail
+			}
 			fmt.Fprintf(w, `
 			<div class="result-card">
-				<img src="/image/?path=%s" alt="%s" class="result-image" loading="lazy">
+				<img src="%s" alt="%s" class="result-image" loading="lazy">
 				<div class="result-content">
 					<div class="result-filename">%s</div>
 					<div class="result-path">%s</div>
@@ -1242,7 +1290,7 @@ func makeSimilarHandler(db *sql.DB, ollamaURL, embeddingModel string) http.Handl
 					</div>
 				</div>
 			</div>`,
-				encodedPath,
+				imgSrc,
 				template.HTMLEscapeString(result.Filename),
 				template.HTMLEscapeString(result.Filename),
 				template.HTMLEscapeString(result.Path),
