@@ -82,11 +82,29 @@ type OllamaEmbeddingResponse struct {
 	Embedding []float32 `json:"embedding"`
 }
 
+type OllamaChatMessage struct {
+	Role    string   `json:"role"`
+	Content string   `json:"content"`
+	Images  []string `json:"images,omitempty"`
+}
+
+type OllamaChatRequest struct {
+	Model    string              `json:"model"`
+	Messages []OllamaChatMessage `json:"messages"`
+	Stream   bool                `json:"stream"`
+}
+
+type OllamaChatResponse struct {
+	Message OllamaChatMessage `json:"message"`
+}
+
 func main() {
 	var dbPath string
 	var apiKey string
 	var ollamaURL string
 	var embeddingModel string
+	var visionModel string
+	var useAnthropic bool
 	var searchQuery string
 	var webMode bool
 	var port int
@@ -100,9 +118,11 @@ func main() {
 	defaultDB := filepath.Join(homeDir, ".lensdb.db")
 
 	flag.StringVar(&dbPath, "db", defaultDB, "Path to SQLite database file")
-	flag.StringVar(&apiKey, "api-key", "", "Anthropic API key (or set ANTHROPIC_API_KEY env var)")
+	flag.StringVar(&apiKey, "api-key", "", "Anthropic API key (or set ANTHROPIC_API_KEY env var, only needed with -use-anthropic)")
 	flag.StringVar(&ollamaURL, "ollama-url", "", "Ollama server URL (or set OLLAMA_URL env var, default: http://localhost:11434)")
 	flag.StringVar(&embeddingModel, "embedding-model", "", "Ollama embedding model (or set OLLAMA_EMBEDDING_MODEL env var, default: nomic-embed-text)")
+	flag.StringVar(&visionModel, "vision-model", "", "Ollama vision model for image descriptions (or set OLLAMA_VISION_MODEL env var, default: qwen3-vl:8b)")
+	flag.BoolVar(&useAnthropic, "use-anthropic", false, "Use Anthropic Claude for image descriptions instead of Ollama vision model")
 	flag.StringVar(&searchQuery, "search", "", "Search for images by description (semantic search)")
 	flag.BoolVar(&webMode, "web", false, "Start web interface for searching images")
 	flag.IntVar(&port, "port", 8080, "Port for web interface (default: 8080)")
@@ -122,6 +142,14 @@ func main() {
 		embeddingModel = os.Getenv("OLLAMA_EMBEDDING_MODEL")
 		if embeddingModel == "" {
 			embeddingModel = "nomic-embed-text"
+		}
+	}
+
+	// Get vision model from environment if not provided
+	if visionModel == "" {
+		visionModel = os.Getenv("OLLAMA_VISION_MODEL")
+		if visionModel == "" {
+			visionModel = "qwen3-vl:8b"
 		}
 	}
 
@@ -182,45 +210,51 @@ func main() {
 			"  or:  lensdb -web [options]\n\n" +
 			"Options:\n" +
 			"  -db              Path to SQLite database file\n" +
-			"  -api-key         Anthropic API key (or set ANTHROPIC_API_KEY env var)\n" +
 			"  -ollama-url      Ollama server URL (or set OLLAMA_URL env var)\n" +
 			"  -embedding-model Ollama embedding model (or set OLLAMA_EMBEDDING_MODEL env var)\n" +
+			"  -vision-model    Ollama vision model for descriptions (or set OLLAMA_VISION_MODEL env var)\n" +
+			"  -use-anthropic   Use Anthropic Claude for image descriptions instead of Ollama\n" +
+			"  -api-key         Anthropic API key (or set ANTHROPIC_API_KEY env var, only with -use-anthropic)\n" +
 			"  -search          Search for images by description\n" +
 			"  -similar         Find images similar to the specified image\n" +
 			"  -web             Start web interface for searching images\n" +
 			"  -port            Port for web interface (default: 8080)\n\n" +
 			"Environment Variables:\n" +
-			"  ANTHROPIC_API_KEY       Anthropic API key for image descriptions\n" +
 			"  OLLAMA_URL              Ollama server URL (default: http://localhost:11434)\n" +
-			"  OLLAMA_EMBEDDING_MODEL  Embedding model name (default: nomic-embed-text)")
+			"  OLLAMA_EMBEDDING_MODEL  Embedding model name (default: nomic-embed-text)\n" +
+			"  OLLAMA_VISION_MODEL     Vision model for descriptions (default: qwen3-vl:8b)\n" +
+			"  ANTHROPIC_API_KEY       Anthropic API key (only needed with -use-anthropic)")
 	}
 	folderPath := flag.Args()[0]
 
-	// Get API key from environment if not provided
-	if apiKey == "" {
-		apiKey = os.Getenv("ANTHROPIC_API_KEY")
-		if apiKey == "" {
-			log.Fatal("Please provide an API key using -api-key flag or ANTHROPIC_API_KEY environment variable")
-		}
-	}
-
-	// Verify both APIs are available before processing
+	// Verify Ollama embedding API is available before processing
 	if err := verifyOllamaAPI(ollamaURL, embeddingModel); err != nil {
 		log.Fatalf("Error: Ollama API is not available at %s\n"+
 			"Please ensure Ollama is running and the model '%s' is available.\n"+
 			"Details: %v", ollamaURL, embeddingModel, err)
 	}
 
-	if err := verifyAnthropicAPI(apiKey); err != nil {
-		log.Fatalf("Error: Anthropic API is not available.\n"+
-			"Please check your API key and network connection.\n"+
-			"Details: %v", err)
+	if useAnthropic {
+		// Get API key from environment if not provided
+		if apiKey == "" {
+			apiKey = os.Getenv("ANTHROPIC_API_KEY")
+			if apiKey == "" {
+				log.Fatal("Please provide an API key using -api-key flag or ANTHROPIC_API_KEY environment variable")
+			}
+		}
+
+		if err := verifyAnthropicAPI(apiKey); err != nil {
+			log.Fatalf("Error: Anthropic API is not available.\n"+
+				"Please check your API key and network connection.\n"+
+				"Details: %v", err)
+		}
+		fmt.Println("API verification successful. Starting image processing with Anthropic Claude...")
+	} else {
+		fmt.Printf("Starting image processing with Ollama vision model '%s'...\n", visionModel)
 	}
 
-	fmt.Println("API verification successful. Starting image processing...")
-
 	// Process images in folder
-	err = processFolder(folderPath, db, apiKey, ollamaURL, embeddingModel)
+	err = processFolder(folderPath, db, apiKey, ollamaURL, embeddingModel, visionModel, useAnthropic)
 	if err != nil {
 		log.Fatalf("Failed to process folder: %v", err)
 	}
@@ -419,7 +453,7 @@ func verifyAnthropicAPI(apiKey string) error {
 	return nil
 }
 
-func processFolder(folderPath string, db *sql.DB, apiKey, ollamaURL, embeddingModel string) error {
+func processFolder(folderPath string, db *sql.DB, apiKey, ollamaURL, embeddingModel, visionModel string, useAnthropic bool) error {
 	imageExtensions := map[string]bool{
 		".jpg":  true,
 		".jpeg": true,
@@ -456,9 +490,17 @@ func processFolder(folderPath string, db *sql.DB, apiKey, ollamaURL, embeddingMo
 
 		fmt.Printf("Processing: %s\n", path)
 
-		description, err := describeImage(path, apiKey)
-		if err != nil {
-			return fmt.Errorf("failed to describe image %s - Anthropic API error: %w", path, err)
+		var description string
+		if useAnthropic {
+			description, err = describeImage(path, apiKey)
+			if err != nil {
+				return fmt.Errorf("failed to describe image %s - Anthropic API error: %w", path, err)
+			}
+		} else {
+			description, err = describeImageWithOllama(path, ollamaURL, visionModel)
+			if err != nil {
+				return fmt.Errorf("failed to describe image %s - Ollama API error: %w", path, err)
+			}
 		}
 
 		// Generate embedding from description
@@ -652,6 +694,89 @@ func describeImage(imagePath string, apiKey string) (string, error) {
 	}
 
 	return apiResp.Content[0].Text, nil
+}
+
+// describeImageWithOllama calls the Ollama chat API with a vision model to describe an image
+func describeImageWithOllama(imagePath, ollamaURL, visionModel string) (string, error) {
+	// Read and decode image file
+	file, err := os.Open(imagePath)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+
+	img, format, err := image.Decode(file)
+	if err != nil {
+		return "", fmt.Errorf("failed to decode image: %w", err)
+	}
+
+	// Resize image if needed (longest side = 1000px)
+	img = resizeImage(img, 1000)
+
+	// Re-encode image to JPEG bytes (Ollama vision models accept JPEG/PNG base64)
+	var buf bytes.Buffer
+	switch format {
+	case "png":
+		err = png.Encode(&buf, img)
+	default:
+		err = jpeg.Encode(&buf, img, &jpeg.Options{Quality: 85})
+	}
+	if err != nil {
+		return "", fmt.Errorf("failed to encode resized image: %w", err)
+	}
+
+	base64Image := base64.StdEncoding.EncodeToString(buf.Bytes())
+
+	reqBody := OllamaChatRequest{
+		Model:  visionModel,
+		Stream: false,
+		Messages: []OllamaChatMessage{
+			{
+				Role:    "user",
+				Content: "Please provide a detailed description of this image.",
+				Images:  []string{base64Image},
+			},
+		},
+	}
+
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", err
+	}
+
+	apiURL := ollamaURL + "/api/chat"
+	req, err := http.NewRequest("POST", apiURL, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to connect to Ollama at %s: %w", apiURL, err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("Ollama API request failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var ollamaResp OllamaChatResponse
+	if err := json.Unmarshal(body, &ollamaResp); err != nil {
+		return "", fmt.Errorf("failed to parse Ollama response: %w", err)
+	}
+
+	if ollamaResp.Message.Content == "" {
+		return "", fmt.Errorf("no content in Ollama response")
+	}
+
+	return ollamaResp.Message.Content, nil
 }
 
 func storeImageDescription(db *sql.DB, imagePath string, description string, embedding []float32, thumbnail []byte) error {

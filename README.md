@@ -1,6 +1,6 @@
 # LensDB - Image Description Tool
 
-A Go tool that processes images in a folder using the Anthropic API to generate descriptions and stores them in a SQLite database.
+A Go tool that processes images in a folder, generates descriptions using an Ollama vision model (or optionally the Anthropic API), creates semantic embeddings using Ollama, and stores them in a SQLite database with vector search capabilities.
 
 ## Installation
 
@@ -26,18 +26,21 @@ go build
 #### Direct usage
 
 ```bash
-# Set environment variables
-export ANTHROPIC_API_KEY=your-api-key-here
-export OLLAMA_URL=http://192.168.1.100:11434
-
-# Run the tool (uses environment variables)
+# Run with default Ollama vision model (qwen3-vl:8b) — no Anthropic key needed
 ./lensdb /path/to/images
 
-# Or use command-line flags (override environment variables)
-./lensdb /path/to/images -api-key your-api-key-here -ollama-url http://localhost:11434
+# Use a different Ollama vision model
+./lensdb /path/to/images -vision-model llava:13b
 
-# Specify custom database path and embedding model
-./lensdb /path/to/images -db custom.db -embedding-model mxbai-embed-large
+# Use Anthropic Claude instead of Ollama for descriptions
+export ANTHROPIC_API_KEY=your-api-key-here
+./lensdb /path/to/images -use-anthropic
+
+# With remote Ollama and custom database
+./lensdb /path/to/images -ollama-url http://192.168.1.100:11434 -db custom.db
+
+# Specify custom embedding model
+./lensdb /path/to/images -embedding-model mxbai-embed-large
 ```
 
 ### Searching Images
@@ -94,9 +97,11 @@ Then open your browser to `http://localhost:8080` (or your specified port) to se
 Command-line flags override environment variables:
 
 - `-db`: Path to SQLite database file (default: `~/.lensdb.db`)
-- `-api-key`: Anthropic API key (env: `ANTHROPIC_API_KEY`)
 - `-ollama-url`: Ollama server URL (env: `OLLAMA_URL`, default: `http://localhost:11434`)
-- `-embedding-model`: Ollama embedding model (env: `OLLAMA_EMBEDDING_MODEL`, default: `nomic-embed-text`)
+- `-embedding-model`: Ollama embedding model for search (env: `OLLAMA_EMBEDDING_MODEL`, default: `nomic-embed-text`)
+- `-vision-model`: Ollama vision model for image descriptions (env: `OLLAMA_VISION_MODEL`, default: `qwen3-vl:8b`)
+- `-use-anthropic`: Use Anthropic Claude for image descriptions instead of Ollama (requires `-api-key` or `ANTHROPIC_API_KEY`)
+- `-api-key`: Anthropic API key (env: `ANTHROPIC_API_KEY`, only needed with `-use-anthropic`)
 - `-search`: Search query for semantic image search
 - `-similar`: Find images similar to the specified image path
 - `-web`: Start web interface for interactive searching
@@ -111,35 +116,42 @@ Command-line flags override environment variables:
 
 ## Features
 
+- **Ollama-First Descriptions**: Image descriptions are generated locally using any Ollama vision model (default: `qwen3-vl:8b`) — no Anthropic API key required by default.
+- **Anthropic Claude Fallback**: Optionally use Claude Sonnet via `-use-anthropic` for descriptions if you prefer a cloud-based model.
 - **Web Interface**: Interactive browser-based search interface for exploring your image collection with real-time semantic search results and "Find Similar" functionality.
 - **Semantic Search**: Search your image collection using natural language queries powered by Ollama embeddings and sqlite-vec. Find images based on their content, not just filenames.
 - **Find Similar Images**: Discover images visually similar to a given image by comparing their embeddings. Works in both CLI and web interface modes.
-- **Smart Duplicate Detection**: Images already in the database are automatically skipped, avoiding redundant API calls and saving costs. Re-run the tool on the same folder anytime to process only new images.
-- **Automatic Image Resizing**: Large images are automatically resized to 1000px on their longest side before being sent to the API. This ensures images stay under the 5MB API limit while maintaining quality.
+- **Smart Duplicate Detection**: Images already in the database are automatically skipped, avoiding redundant processing. Re-run the tool on the same folder anytime to process only new images.
+- **Automatic Image Resizing**: Large images are automatically resized to 1000px on their longest side before being sent to the vision model. This ensures images stay under API size limits while maintaining quality.
 - **High-Quality Processing**: Uses Catmull-Rom interpolation for smooth, professional-looking resized images.
 - **Format Preservation**: Resized images maintain their original format where possible (JPEG at 85% quality, PNG, GIF).
-- **Remote Ollama Support**: Connect to Ollama running on any machine in your network for embeddings generation.
+- **Remote Ollama Support**: Connect to Ollama running on any machine in your network for both vision inference and embedding generation.
 
 ## Prerequisites
 
-- **Ollama**: Install and run [Ollama](https://ollama.com/) for embeddings generation
+- **Ollama**: Install and run [Ollama](https://ollama.com/) for vision inference and embedding generation
+- **Vision Model**: Pull the default vision model:
+  ```bash
+  ollama pull qwen3-vl:8b
+  ```
 - **Embedding Model**: Pull the embedding model (default is `nomic-embed-text`):
   ```bash
   ollama pull nomic-embed-text
   ```
-- **Anthropic API Key**: Get your API key from [Anthropic Console](https://console.anthropic.com/)
+- **Anthropic API Key** *(optional)*: Only required when using `-use-anthropic`. Get your key from [Anthropic Console](https://console.anthropic.com/)
 
 ## Environment Variables
 
 You can configure LensDB using environment variables instead of command-line flags:
 
 ```bash
-# Required for processing images
-export ANTHROPIC_API_KEY=your-api-key-here
-
-# Optional - Ollama configuration
+# Ollama configuration (all optional)
 export OLLAMA_URL=http://192.168.1.100:11434  # default: http://localhost:11434
+export OLLAMA_VISION_MODEL=llava:13b          # default: qwen3-vl:8b
 export OLLAMA_EMBEDDING_MODEL=mxbai-embed-large  # default: nomic-embed-text
+
+# Only needed when using -use-anthropic
+export ANTHROPIC_API_KEY=your-api-key-here
 ```
 
 These can be set in a `.env` file when using `run.sh` with dotenvx.
@@ -178,8 +190,8 @@ This will:
 1. Scan all images in the `~/Pictures/vacation` folder (including subdirectories)
 2. Skip any images already processed (already in database)
 3. Resize any large images to 1000px maximum on the longest side
-4. Send each new image to the Anthropic API for description
-5. Generate embeddings from descriptions using Ollama
+4. Send each new image to the Ollama vision model (`qwen3-vl:8b`) for description
+5. Generate embeddings from descriptions using Ollama (`nomic-embed-text`)
 6. Store the results and embeddings in `~/.lensdb.db`
 
 Running the same command again will only process newly added images, skipping those already in the database.
@@ -205,13 +217,13 @@ sqlite3 ~/.lensdb.db "SELECT filename, description FROM image_descriptions;"
 
 LensDB uses the following Go packages:
 
-- **github.com/mattn/go-sqlite3** (v1.14.32): SQLite database driver
+- **github.com/mattn/go-sqlite3** (v1.14.34): SQLite database driver
 - **github.com/asg017/sqlite-vec-go-bindings** (v0.1.6): SQLite vector search extension
-- **golang.org/x/image** (v0.34.0): Image processing and format support (including WebP)
+- **golang.org/x/image** (v0.36.0): Image processing and format support (including WebP)
 
 ### System Requirements
 
 - Go 1.24.0 or higher
 - CGO enabled (required for SQLite compilation)
-- Ollama running locally or on remote server
-- Anthropic API key for image description generation
+- Ollama running locally or on remote server (for vision inference and embeddings)
+- Anthropic API key only required when using `-use-anthropic`
