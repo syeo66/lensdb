@@ -104,6 +104,19 @@ Rebuild the vector and full-text search indexes from the descriptions already st
 
 > **Note:** If you change the embedding model, the vector dimensions may change. LensDB will automatically drop and recreate the vec table on startup, then prompt you to run `-reindex`.
 
+### Cleanup
+
+Remove database entries for image files that no longer exist on disk. Useful after moving, renaming, or deleting images:
+
+```bash
+./lensdb -cleanup
+
+# With a custom database
+./lensdb -cleanup -db custom.db
+```
+
+Displays a live `[n/total]` progress counter while checking, prints each removed path, and finishes with a summary.
+
 ## Flags
 
 Command-line flags override environment variables:
@@ -119,6 +132,7 @@ Command-line flags override environment variables:
 - `-web`: Start web interface for interactive searching
 - `-port`: Port for web interface (default: `8080`)
 - `-reindex`: Rebuild vector and full-text search indexes from existing descriptions
+- `-cleanup`: Remove database entries for image files that no longer exist on disk
 
 ## Supported Image Formats
 
@@ -136,6 +150,7 @@ Command-line flags override environment variables:
 - **Find Similar Images**: Discover visually similar images by comparing embeddings — available in both CLI and web modes.
 - **Smart Duplicate Detection**: Images already in the database are automatically skipped.
 - **Reindex**: Rebuild indexes at any time without re-describing images — useful after switching embedding models.
+- **Cleanup**: Remove stale database entries for images that have been moved or deleted, with a live progress counter.
 - **Automatic Image Resizing**: Images are resized to 1000px on the longest side before being sent to the vision model, using Catmull-Rom interpolation for quality.
 - **Remote Ollama Support**: Connect to Ollama on any machine in your network.
 
