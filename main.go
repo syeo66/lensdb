@@ -29,6 +29,10 @@ import (
 
 const anthropicAPIURL = "https://api.anthropic.com/v1/messages"
 
+// embeddingDimensions must match the model in use.
+// bge-m3 (default) produces 1024-dim vectors.
+const embeddingDimensions = 1024
+
 type ImageDescription struct {
 	Filename    string
 	Foldername  string
@@ -110,6 +114,7 @@ func main() {
 	var webMode bool
 	var port int
 	var similarImage string
+	var reindex bool
 
 	// Get default database path in home directory
 	homeDir, err := os.UserHomeDir()
@@ -128,6 +133,7 @@ func main() {
 	flag.BoolVar(&webMode, "web", false, "Start web interface for searching images")
 	flag.IntVar(&port, "port", 8080, "Port for web interface (default: 8080)")
 	flag.StringVar(&similarImage, "similar", "", "Find images similar to the given image path")
+	flag.BoolVar(&reindex, "reindex", false, "Rebuild the vector and full-text search indexes from existing descriptions")
 	flag.Parse()
 
 	// Get Ollama URL from environment if not provided
@@ -142,7 +148,7 @@ func main() {
 	if embeddingModel == "" {
 		embeddingModel = os.Getenv("OLLAMA_EMBEDDING_MODEL")
 		if embeddingModel == "" {
-			embeddingModel = "nomic-embed-text"
+			embeddingModel = "bge-m3"
 		}
 	}
 
@@ -203,12 +209,26 @@ func main() {
 		return
 	}
 
+	// Handle reindex mode
+	if reindex {
+		if err := verifyOllamaAPI(ollamaURL, embeddingModel); err != nil {
+			log.Fatalf("Error: Ollama API is not available at %s\n"+
+				"Please ensure Ollama is running and the model '%s' is available.\n"+
+				"Details: %v", ollamaURL, embeddingModel, err)
+		}
+		if err := reindexDatabase(db, ollamaURL, embeddingModel); err != nil {
+			log.Fatalf("Failed to reindex database: %v", err)
+		}
+		return
+	}
+
 	// Handle process mode
 	if len(flag.Args()) == 0 {
 		log.Fatal("Usage: lensdb <folder-path> [options]\n" +
 			"  or:  lensdb -search \"query\" [options]\n" +
 			"  or:  lensdb -similar \"/path/to/image.jpg\" [options]\n" +
-			"  or:  lensdb -web [options]\n\n" +
+			"  or:  lensdb -web [options]\n" +
+			"  or:  lensdb -reindex [options]\n\n" +
 			"Options:\n" +
 			"  -db              Path to SQLite database file\n" +
 			"  -ollama-url      Ollama server URL (or set OLLAMA_URL env var)\n" +
@@ -219,7 +239,8 @@ func main() {
 			"  -search          Search for images by description\n" +
 			"  -similar         Find images similar to the specified image\n" +
 			"  -web             Start web interface for searching images\n" +
-			"  -port            Port for web interface (default: 8080)\n\n" +
+			"  -port            Port for web interface (default: 8080)\n" +
+			"  -reindex         Rebuild vector and full-text search indexes from existing descriptions\n\n" +
 			"Environment Variables:\n" +
 			"  OLLAMA_URL              Ollama server URL (default: http://localhost:11434)\n" +
 			"  OLLAMA_EMBEDDING_MODEL  Embedding model name (default: nomic-embed-text)\n" +
@@ -290,12 +311,24 @@ func initDatabase(dbPath string) (*sql.DB, error) {
 	// Migrate existing databases: add thumbnail column if missing
 	_, _ = db.Exec(`ALTER TABLE image_descriptions ADD COLUMN thumbnail BLOB`)
 
+	// Migrate vec_descriptions if it was created with a different embedding dimension.
+	// Drop and recreate (data will be rebuilt by -reindex).
+	var vecSchema string
+	db.QueryRow("SELECT sql FROM sqlite_master WHERE type='table' AND name='vec_descriptions'").Scan(&vecSchema)
+	expectedDim := fmt.Sprintf("float[%d]", embeddingDimensions)
+	if vecSchema != "" && !strings.Contains(vecSchema, expectedDim) {
+		if _, err = db.Exec("DROP TABLE vec_descriptions"); err != nil {
+			return nil, fmt.Errorf("failed to drop outdated vec_descriptions: %w", err)
+		}
+		log.Printf("vec_descriptions dimension changed to %d — run -reindex to rebuild the vector index.", embeddingDimensions)
+	}
+
 	// Create virtual table for vector search if not exists
-	createVecTableSQL := `
+	createVecTableSQL := fmt.Sprintf(`
 	CREATE VIRTUAL TABLE IF NOT EXISTS vec_descriptions USING vec0(
-		embedding float[768]
+		embedding float[%d]
 	);
-	`
+	`, embeddingDimensions)
 
 	_, err = db.Exec(createVecTableSQL)
 	if err != nil {
@@ -1160,6 +1193,118 @@ func findSimilarImagesForWeb(db *sql.DB, imagePath string) ([]SearchResult, erro
 	}
 
 	return results, rows.Err()
+}
+
+// reindexDatabase regenerates embeddings for every row and rebuilds vec_descriptions
+// and fts_descriptions from scratch. Each row is committed individually so a partial
+// run still leaves the database in a consistent state.
+func reindexDatabase(db *sql.DB, ollamaURL, embeddingModel string) error {
+	// Count rows for progress reporting.
+	var total int
+	if err := db.QueryRow("SELECT COUNT(*) FROM image_descriptions").Scan(&total); err != nil {
+		return fmt.Errorf("failed to count rows: %w", err)
+	}
+	if total == 0 {
+		fmt.Println("Database is empty – nothing to reindex.")
+		return nil
+	}
+	fmt.Printf("Reindexing %d entries...\n", total)
+
+	// Wipe the derived indexes; we rebuild them row by row below.
+	if _, err := db.Exec("DELETE FROM vec_descriptions"); err != nil {
+		return fmt.Errorf("failed to clear vec_descriptions: %w", err)
+	}
+
+	// fts5 may not be compiled into the current binary; treat it as best-effort.
+	ftsAvailable := true
+	if _, err := db.Exec("DELETE FROM fts_descriptions"); err != nil {
+		log.Printf("Warning: could not clear fts_descriptions (%v); full-text search index will not be rebuilt.", err)
+		ftsAvailable = false
+	}
+
+	// Load all rows into memory before writing so the read cursor doesn't
+	// block the write transactions (SQLite only allows one writer at a time).
+	type entry struct {
+		id          int64
+		description string
+	}
+	rows, err := db.Query("SELECT id, description FROM image_descriptions ORDER BY id")
+	if err != nil {
+		return fmt.Errorf("failed to query descriptions: %w", err)
+	}
+	var entries []entry
+	for rows.Next() {
+		var e entry
+		if err := rows.Scan(&e.id, &e.description); err != nil {
+			rows.Close()
+			return fmt.Errorf("failed to scan row: %w", err)
+		}
+		entries = append(entries, e)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("row iteration error: %w", err)
+	}
+
+	done := 0
+	errors := 0
+	for _, e := range entries {
+		embedding, err := generateEmbedding(e.description, ollamaURL, embeddingModel)
+		if err != nil {
+			log.Printf("Error generating embedding for id %d: %v", e.id, err)
+			errors++
+			continue
+		}
+
+		embeddingBlob, err := sqlite_vec.SerializeFloat32(embedding)
+		if err != nil {
+			log.Printf("Error serializing embedding for id %d: %v", e.id, err)
+			errors++
+			continue
+		}
+
+		tx, err := db.Begin()
+		if err != nil {
+			log.Printf("Error starting transaction for id %d: %v", e.id, err)
+			errors++
+			continue
+		}
+
+		// Update stored embedding in the main table.
+		if _, err := tx.Exec("UPDATE image_descriptions SET embedding = ? WHERE id = ?", embeddingBlob, e.id); err != nil {
+			tx.Rollback()
+			log.Printf("Error updating embedding for id %d: %v", e.id, err)
+			errors++
+			continue
+		}
+
+		// Rebuild vec entry.
+		if _, err := tx.Exec("INSERT OR REPLACE INTO vec_descriptions (rowid, embedding) VALUES (?, ?)", e.id, embeddingBlob); err != nil {
+			tx.Rollback()
+			log.Printf("Error updating vec_descriptions for id %d: %v", e.id, err)
+			errors++
+			continue
+		}
+
+		// Rebuild FTS entry (best-effort).
+		if ftsAvailable {
+			if _, err := tx.Exec("INSERT INTO fts_descriptions (rowid, description) VALUES (?, ?)", e.id, e.description); err != nil {
+				log.Printf("Warning: failed to update fts_descriptions for id %d: %v", e.id, err)
+			}
+		}
+
+		if err := tx.Commit(); err != nil {
+			log.Printf("Error committing transaction for id %d: %v", e.id, err)
+			errors++
+			continue
+		}
+
+		done++
+		fmt.Printf("✓ [%d/%d] id=%d\n", done, total, e.id)
+	}
+
+	fmt.Printf("\nReindex complete: %d succeeded, %d failed.\n", done, errors)
+	return nil
 }
 
 // startWebServer starts the HTTP server for web interface
