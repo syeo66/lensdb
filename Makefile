@@ -6,7 +6,7 @@ INSTALL_DIR=$(HOME)/bin
 all: build
 
 build:
-	go build -o $(BINARY_NAME)
+	go build -tags fts5 -o $(BINARY_NAME)
 
 install: build
 	mkdir -p $(INSTALL_DIR)

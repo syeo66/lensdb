@@ -18,6 +18,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	sqlite_vec "github.com/asg017/sqlite-vec-go-bindings/cgo"
@@ -299,6 +300,22 @@ func initDatabase(dbPath string) (*sql.DB, error) {
 	_, err = db.Exec(createVecTableSQL)
 	if err != nil {
 		return nil, err
+	}
+
+	// Create FTS5 virtual table for full-text search if not exists
+	createFTSSQL := `
+	CREATE VIRTUAL TABLE IF NOT EXISTS fts_descriptions USING fts5(description);
+	`
+	_, err = db.Exec(createFTSSQL)
+	if err != nil {
+		return nil, err
+	}
+
+	// Migrate existing databases: populate FTS table if it is empty
+	var ftsCount int
+	db.QueryRow("SELECT COUNT(*) FROM fts_descriptions").Scan(&ftsCount)
+	if ftsCount == 0 {
+		_, _ = db.Exec(`INSERT INTO fts_descriptions(rowid, description) SELECT id, description FROM image_descriptions`)
 	}
 
 	return db, nil
@@ -800,6 +817,13 @@ func storeImageDescription(db *sql.DB, imagePath string, description string, emb
 	}
 	defer tx.Rollback()
 
+	// If a row for this path already exists, delete its FTS entry first (INSERT OR
+	// REPLACE re-assigns the autoincrement id, which would orphan the old rowid).
+	var oldID int64
+	if err := tx.QueryRow("SELECT id FROM image_descriptions WHERE path = ?", absPath).Scan(&oldID); err == nil {
+		_, _ = tx.Exec("DELETE FROM fts_descriptions WHERE rowid = ?", oldID)
+	}
+
 	// Insert or replace in main table
 	insertSQL := `
 	INSERT OR REPLACE INTO image_descriptions (filename, foldername, path, description, embedding, thumbnail)
@@ -828,10 +852,141 @@ func storeImageDescription(db *sql.DB, imagePath string, description string, emb
 		return err
 	}
 
+	// Insert into FTS table (rowid must match)
+	_, err = tx.Exec("INSERT INTO fts_descriptions(rowid, description) VALUES(?, ?)", rowID, description)
+	if err != nil {
+		return err
+	}
+
 	return tx.Commit()
 }
 
-// searchImages performs semantic search for images based on a query
+// hybridSearch runs vector search and FTS, merges results with Reciprocal Rank
+// Fusion (k=60), giving FTS matches ftsWeight× the vector weight so that exact
+// word matches surface above purely contextual ones.
+func hybridSearch(db *sql.DB, queryBlob []byte, ftsQuery string, limit int) ([]SearchResult, error) {
+	type entry struct {
+		SearchResult
+		id int64
+	}
+
+	const rrfK = 60.0
+	const ftsWeight = 2.0
+
+	// --- Vector search (fetch more than needed so RRF has enough candidates) ---
+	vecSQL := `
+	SELECT
+		img.id,
+		img.filename,
+		img.foldername,
+		img.path,
+		img.description,
+		vec.distance,
+		img.thumbnail
+	FROM vec_descriptions vec
+	INNER JOIN image_descriptions img ON vec.rowid = img.id
+	WHERE vec.embedding MATCH ? AND k = ?
+	ORDER BY vec.distance
+	`
+	vecRows, err := db.Query(vecSQL, queryBlob, limit*5)
+	if err != nil {
+		return nil, fmt.Errorf("vector search failed: %w", err)
+	}
+	defer vecRows.Close()
+
+	var vecEntries []entry
+	for vecRows.Next() {
+		var e entry
+		var thumbnailBlob []byte
+		if err := vecRows.Scan(&e.id, &e.Filename, &e.Foldername, &e.Path, &e.Description, &e.Distance, &thumbnailBlob); err != nil {
+			return nil, err
+		}
+		if len(thumbnailBlob) > 0 {
+			e.Thumbnail = base64.StdEncoding.EncodeToString(thumbnailBlob)
+		}
+		vecEntries = append(vecEntries, e)
+	}
+	if err := vecRows.Err(); err != nil {
+		return nil, err
+	}
+
+	// --- FTS search (best-effort; fall back to vector-only on error) ---
+	type ftsEntry struct {
+		id int64
+	}
+	var ftsEntries []ftsEntry
+
+	ftsSQL := `
+	SELECT img.id
+	FROM fts_descriptions fts
+	JOIN image_descriptions img ON fts.rowid = img.id
+	WHERE fts.description MATCH ?
+	ORDER BY rank
+	LIMIT ?
+	`
+	ftsRows, ftsErr := db.Query(ftsSQL, ftsQuery, limit*5)
+	if ftsErr == nil {
+		defer ftsRows.Close()
+		for ftsRows.Next() {
+			var fe ftsEntry
+			if err := ftsRows.Scan(&fe.id); err == nil {
+				ftsEntries = append(ftsEntries, fe)
+			}
+		}
+	}
+	// ftsErr != nil just means we skip FTS contribution (vector search still runs)
+
+	// --- Reciprocal Rank Fusion ---
+	type scored struct {
+		entry
+		score float64
+	}
+
+	scoreMap := make(map[int64]*scored)
+
+	for rank, e := range vecEntries {
+		s := 1.0 / (rrfK + float64(rank))
+		cp := e
+		scoreMap[e.id] = &scored{entry: cp, score: s}
+	}
+
+	for rank, fe := range ftsEntries {
+		s := ftsWeight / (rrfK + float64(rank))
+		if existing, ok := scoreMap[fe.id]; ok {
+			existing.score += s
+		} else {
+			// FTS-only hit: we need the full row data
+			var e entry
+			var thumbnailBlob []byte
+			row := db.QueryRow(`SELECT id, filename, foldername, path, description, 0.0, thumbnail FROM image_descriptions WHERE id = ?`, fe.id)
+			if err := row.Scan(&e.id, &e.Filename, &e.Foldername, &e.Path, &e.Description, &e.Distance, &thumbnailBlob); err == nil {
+				if len(thumbnailBlob) > 0 {
+					e.Thumbnail = base64.StdEncoding.EncodeToString(thumbnailBlob)
+				}
+				scoreMap[fe.id] = &scored{entry: e, score: s}
+			}
+		}
+	}
+
+	var combined []scored
+	for _, s := range scoreMap {
+		combined = append(combined, *s)
+	}
+	sort.Slice(combined, func(i, j int) bool {
+		return combined[i].score > combined[j].score
+	})
+
+	var results []SearchResult
+	for i, s := range combined {
+		if i >= limit {
+			break
+		}
+		results = append(results, s.SearchResult)
+	}
+	return results, nil
+}
+
+// searchImages performs hybrid (vector + full-text) search for images based on a query
 func searchImages(db *sql.DB, query, ollamaURL, embeddingModel string) error {
 	fmt.Printf("Searching for: %s\n\n", query)
 
@@ -841,56 +996,29 @@ func searchImages(db *sql.DB, query, ollamaURL, embeddingModel string) error {
 		return fmt.Errorf("failed to generate query embedding: %w", err)
 	}
 
-	// Serialize query embedding
 	queryBlob, err := sqlite_vec.SerializeFloat32(queryEmbedding)
 	if err != nil {
 		return fmt.Errorf("failed to serialize query embedding: %w", err)
 	}
 
-	// Search for similar vectors
-	// sqlite-vec requires k parameter in WHERE clause for knn queries
-	searchSQL := `
-	SELECT
-		img.filename,
-		img.foldername,
-		img.path,
-		img.description,
-		vec.distance
-	FROM vec_descriptions vec
-	INNER JOIN image_descriptions img ON vec.rowid = img.id
-	WHERE vec.embedding MATCH ? AND k = ?
-	ORDER BY vec.distance
-	`
-
-	rows, err := db.Query(searchSQL, queryBlob, 10)
+	results, err := hybridSearch(db, queryBlob, query, 10)
 	if err != nil {
-		return fmt.Errorf("search query failed: %w", err)
-	}
-	defer rows.Close()
-
-	results := 0
-	for rows.Next() {
-		var filename, foldername, path, description string
-		var distance float64
-
-		err := rows.Scan(&filename, &foldername, &path, &description, &distance)
-		if err != nil {
-			return err
-		}
-
-		results++
-		fmt.Printf("Result %d (similarity: %.4f):\n", results, 1.0-distance)
-		fmt.Printf("  File: %s\n", path)
-		fmt.Printf("  Description: %s\n\n", description)
+		return err
 	}
 
-	if results == 0 {
+	if len(results) == 0 {
 		fmt.Println("No results found.")
-	} else {
-		fmt.Printf("Found %d matching images.\n", results)
+	}
+	for i, r := range results {
+		fmt.Printf("Result %d:\n", i+1)
+		fmt.Printf("  File: %s\n", r.Path)
+		fmt.Printf("  Description: %s\n\n", r.Description)
+	}
+	if len(results) > 0 {
+		fmt.Printf("Found %d matching images.\n", len(results))
 	}
 
-	return rows.Err()
+	return nil
 }
 
 // findSimilarImages performs similarity search based on an existing image's embedding
@@ -961,66 +1089,19 @@ func findSimilarImages(db *sql.DB, imagePath string) error {
 	return rows.Err()
 }
 
-// searchImagesForWeb performs semantic search and returns results instead of printing them
+// searchImagesForWeb performs hybrid (vector + full-text) search and returns results
 func searchImagesForWeb(db *sql.DB, query, ollamaURL, embeddingModel string) ([]SearchResult, error) {
-	// Generate embedding for the query
 	queryEmbedding, err := generateEmbedding(query, ollamaURL, embeddingModel)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate query embedding: %w", err)
 	}
 
-	// Serialize query embedding
 	queryBlob, err := sqlite_vec.SerializeFloat32(queryEmbedding)
 	if err != nil {
 		return nil, fmt.Errorf("failed to serialize query embedding: %w", err)
 	}
 
-	// Search for similar vectors
-	searchSQL := `
-	SELECT
-		img.filename,
-		img.foldername,
-		img.path,
-		img.description,
-		vec.distance,
-		img.thumbnail
-	FROM vec_descriptions vec
-	INNER JOIN image_descriptions img ON vec.rowid = img.id
-	WHERE vec.embedding MATCH ? AND k = ?
-	ORDER BY vec.distance
-	`
-
-	rows, err := db.Query(searchSQL, queryBlob, 25)
-	if err != nil {
-		return nil, fmt.Errorf("search query failed: %w", err)
-	}
-	defer rows.Close()
-
-	var results []SearchResult
-	for rows.Next() {
-		var filename, foldername, path, description string
-		var distance float64
-		var thumbnailBlob []byte
-
-		err := rows.Scan(&filename, &foldername, &path, &description, &distance, &thumbnailBlob)
-		if err != nil {
-			return nil, err
-		}
-
-		result := SearchResult{
-			Filename:    filename,
-			Foldername:  foldername,
-			Path:        path,
-			Description: description,
-			Distance:    distance,
-		}
-		if len(thumbnailBlob) > 0 {
-			result.Thumbnail = base64.StdEncoding.EncodeToString(thumbnailBlob)
-		}
-		results = append(results, result)
-	}
-
-	return results, rows.Err()
+	return hybridSearch(db, queryBlob, query, 25)
 }
 
 // findSimilarImagesForWeb performs similarity search for web interface and returns results

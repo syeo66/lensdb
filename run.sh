@@ -13,6 +13,6 @@ FOLDER="$1"
 DB_PATH="${2:-$HOME/.lensdb.db}"
 
 tmpFile=$(mktemp)
-go build -o "$tmpFile" *.go
+go build -tags fts5 -o "$tmpFile" *.go
 dotenvx run -- $tmpFile "$FOLDER" -db "$DB_PATH"
 
