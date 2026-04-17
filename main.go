@@ -115,6 +115,7 @@ func main() {
 	var port int
 	var similarImage string
 	var reindex bool
+	var cleanup bool
 
 	// Get default database path in home directory
 	homeDir, err := os.UserHomeDir()
@@ -134,6 +135,42 @@ func main() {
 	flag.IntVar(&port, "port", 8080, "Port for web interface (default: 8080)")
 	flag.StringVar(&similarImage, "similar", "", "Find images similar to the given image path")
 	flag.BoolVar(&reindex, "reindex", false, "Rebuild the vector and full-text search indexes from existing descriptions")
+	flag.BoolVar(&cleanup, "cleanup", false, "Remove database entries for image files that no longer exist on disk")
+
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: lensdb [flags] [image-folder [db-path]]\n\n")
+
+		fmt.Fprintf(os.Stderr, "Modes (default: process image-folder):\n")
+		for _, name := range []string{"search", "similar", "web", "reindex", "cleanup"} {
+			f := flag.Lookup(name)
+			fmt.Fprintf(os.Stderr, "  -%s\t%s\n", f.Name, f.Usage)
+		}
+
+		fmt.Fprintf(os.Stderr, "\nDatabase:\n")
+		for _, name := range []string{"db"} {
+			f := flag.Lookup(name)
+			fmt.Fprintf(os.Stderr, "  -%s\t%s\n", f.Name, f.Usage)
+		}
+
+		fmt.Fprintf(os.Stderr, "\nOllama settings:\n")
+		for _, name := range []string{"ollama-url", "vision-model", "embedding-model"} {
+			f := flag.Lookup(name)
+			fmt.Fprintf(os.Stderr, "  -%s\t%s\n", f.Name, f.Usage)
+		}
+
+		fmt.Fprintf(os.Stderr, "\nAnthropic settings (optional alternative for image descriptions):\n")
+		for _, name := range []string{"use-anthropic", "api-key"} {
+			f := flag.Lookup(name)
+			fmt.Fprintf(os.Stderr, "  -%s\t%s\n", f.Name, f.Usage)
+		}
+
+		fmt.Fprintf(os.Stderr, "\nWeb server:\n")
+		for _, name := range []string{"port"} {
+			f := flag.Lookup(name)
+			fmt.Fprintf(os.Stderr, "  -%s\t%s\n", f.Name, f.Usage)
+		}
+	}
+
 	flag.Parse()
 
 	// Get Ollama URL from environment if not provided
@@ -218,6 +255,14 @@ func main() {
 		}
 		if err := reindexDatabase(db, ollamaURL, embeddingModel); err != nil {
 			log.Fatalf("Failed to reindex database: %v", err)
+		}
+		return
+	}
+
+	// Handle cleanup mode
+	if cleanup {
+		if err := cleanupDatabase(db); err != nil {
+			log.Fatalf("Failed to clean up database: %v", err)
 		}
 		return
 	}
@@ -1193,6 +1238,58 @@ func findSimilarImagesForWeb(db *sql.DB, imagePath string) ([]SearchResult, erro
 	}
 
 	return results, rows.Err()
+}
+
+// cleanupDatabase removes rows from image_descriptions (and the associated vec/fts rows)
+// where the file no longer exists on disk.
+func cleanupDatabase(db *sql.DB) error {
+	rows, err := db.Query(`SELECT id, path FROM image_descriptions ORDER BY id`)
+	if err != nil {
+		return fmt.Errorf("querying paths: %w", err)
+	}
+	type entry struct {
+		id   int64
+		path string
+	}
+	var entries []entry
+	for rows.Next() {
+		var e entry
+		if err := rows.Scan(&e.id, &e.path); err != nil {
+			rows.Close()
+			return fmt.Errorf("scanning row: %w", err)
+		}
+		entries = append(entries, e)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterating rows: %w", err)
+	}
+
+	total := len(entries)
+	if total == 0 {
+		fmt.Println("Database is empty – nothing to clean up.")
+		return nil
+	}
+	fmt.Printf("Checking %d entries...\n", total)
+
+	removed := 0
+	for i, e := range entries {
+		fmt.Printf("\r[%d/%d] checking...", i+1, total)
+		if _, err := os.Stat(e.path); err == nil {
+			continue
+		}
+		if _, err := db.Exec(`DELETE FROM image_descriptions WHERE id = ?`, e.id); err != nil {
+			fmt.Println()
+			log.Printf("Failed to delete row %d (%s): %v", e.id, e.path, err)
+			continue
+		}
+		db.Exec(`DELETE FROM vec_descriptions WHERE rowid = ?`, e.id)
+		db.Exec(`DELETE FROM fts_descriptions WHERE rowid = ?`, e.id)
+		fmt.Printf("\r✗ Removed: %s\n", e.path)
+		removed++
+	}
+	fmt.Printf("\rCleanup complete: removed %d of %d entries.\n", removed, total)
+	return nil
 }
 
 // reindexDatabase regenerates embeddings for every row and rebuilds vec_descriptions
