@@ -116,6 +116,8 @@ func main() {
 	var similarImage string
 	var reindex bool
 	var cleanup bool
+	var pathFilter string
+	var replace bool
 
 	// Get default database path in home directory
 	homeDir, err := os.UserHomeDir()
@@ -136,12 +138,26 @@ func main() {
 	flag.StringVar(&similarImage, "similar", "", "Find images similar to the given image path")
 	flag.BoolVar(&reindex, "reindex", false, "Rebuild the vector and full-text search indexes from existing descriptions")
 	flag.BoolVar(&cleanup, "cleanup", false, "Remove database entries for image files that no longer exist on disk")
+	flag.StringVar(&pathFilter, "path", "", "Restrict search/similar results to images within this directory path")
+	flag.BoolVar(&replace, "replace", false, "Re-process and overwrite descriptions for images already in the database")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: lensdb [flags] [image-folder [db-path]]\n\n")
 
 		fmt.Fprintf(os.Stderr, "Modes (default: process image-folder):\n")
 		for _, name := range []string{"search", "similar", "web", "reindex", "cleanup"} {
+			f := flag.Lookup(name)
+			fmt.Fprintf(os.Stderr, "  -%s\t%s\n", f.Name, f.Usage)
+		}
+
+		fmt.Fprintf(os.Stderr, "\nProcess options:\n")
+		for _, name := range []string{"replace"} {
+			f := flag.Lookup(name)
+			fmt.Fprintf(os.Stderr, "  -%s\t%s\n", f.Name, f.Usage)
+		}
+
+		fmt.Fprintf(os.Stderr, "\nFilters (apply to search, similar, and web modes):\n")
+		for _, name := range []string{"path"} {
 			f := flag.Lookup(name)
 			fmt.Fprintf(os.Stderr, "  -%s\t%s\n", f.Name, f.Usage)
 		}
@@ -172,6 +188,17 @@ func main() {
 	}
 
 	flag.Parse()
+
+	// Normalize pathFilter to an absolute path with trailing separator so
+	// strings.HasPrefix correctly scopes matches to that directory.
+	if pathFilter != "" {
+		if abs, err := filepath.Abs(pathFilter); err == nil {
+			pathFilter = abs
+		}
+		if !strings.HasSuffix(pathFilter, string(filepath.Separator)) {
+			pathFilter += string(filepath.Separator)
+		}
+	}
 
 	// Get Ollama URL from environment if not provided
 	if ollamaURL == "" {
@@ -217,7 +244,7 @@ func main() {
 		}
 
 		fmt.Printf("Starting web server on http://localhost:%d\n", port)
-		startWebServer(db, ollamaURL, embeddingModel, port)
+		startWebServer(db, ollamaURL, embeddingModel, port, pathFilter)
 		return
 	}
 
@@ -230,7 +257,7 @@ func main() {
 				"Details: %v", ollamaURL, embeddingModel, err)
 		}
 
-		err = searchImages(db, searchQuery, ollamaURL, embeddingModel)
+		err = searchImages(db, searchQuery, ollamaURL, embeddingModel, pathFilter)
 		if err != nil {
 			log.Fatalf("Failed to search images: %v", err)
 		}
@@ -239,7 +266,7 @@ func main() {
 
 	// Handle similar image mode
 	if similarImage != "" {
-		err = findSimilarImages(db, similarImage)
+		err = findSimilarImages(db, similarImage, pathFilter)
 		if err != nil {
 			log.Fatalf("Failed to find similar images: %v", err)
 		}
@@ -269,7 +296,7 @@ func main() {
 
 	// Handle process mode
 	if len(flag.Args()) == 0 {
-		log.Fatal("Usage: lensdb <folder-path> [options]\n" +
+		log.Fatal("Usage: lensdb [options] <folder-path>\n" +
 			"  or:  lensdb -search \"query\" [options]\n" +
 			"  or:  lensdb -similar \"/path/to/image.jpg\" [options]\n" +
 			"  or:  lensdb -web [options]\n" +
@@ -321,7 +348,7 @@ func main() {
 	}
 
 	// Process images in folder
-	err = processFolder(folderPath, db, apiKey, ollamaURL, embeddingModel, visionModel, useAnthropic)
+	err = processFolder(folderPath, db, apiKey, ollamaURL, embeddingModel, visionModel, useAnthropic, replace)
 	if err != nil {
 		log.Fatalf("Failed to process folder: %v", err)
 	}
@@ -548,7 +575,7 @@ func verifyAnthropicAPI(apiKey string) error {
 	return nil
 }
 
-func processFolder(folderPath string, db *sql.DB, apiKey, ollamaURL, embeddingModel, visionModel string, useAnthropic bool) error {
+func processFolder(folderPath string, db *sql.DB, apiKey, ollamaURL, embeddingModel, visionModel string, useAnthropic, replace bool) error {
 	imageExtensions := map[string]bool{
 		".jpg":  true,
 		".jpeg": true,
@@ -578,7 +605,7 @@ func processFolder(folderPath string, db *sql.DB, apiKey, ollamaURL, embeddingMo
 			return nil
 		}
 
-		if exists {
+		if exists && !replace {
 			fmt.Printf("⊘ Skipping (already in DB): %s\n", path)
 			return nil
 		}
@@ -942,7 +969,7 @@ func storeImageDescription(db *sql.DB, imagePath string, description string, emb
 // hybridSearch runs vector search and FTS, merges results with Reciprocal Rank
 // Fusion (k=60), giving FTS matches ftsWeight× the vector weight so that exact
 // word matches surface above purely contextual ones.
-func hybridSearch(db *sql.DB, queryBlob []byte, ftsQuery string, limit int) ([]SearchResult, error) {
+func hybridSearch(db *sql.DB, queryBlob []byte, ftsQuery string, limit int, pathFilter string) ([]SearchResult, error) {
 	type entry struct {
 		SearchResult
 		id int64
@@ -1055,9 +1082,12 @@ func hybridSearch(db *sql.DB, queryBlob []byte, ftsQuery string, limit int) ([]S
 	})
 
 	var results []SearchResult
-	for i, s := range combined {
-		if i >= limit {
+	for _, s := range combined {
+		if len(results) >= limit {
 			break
+		}
+		if pathFilter != "" && !strings.HasPrefix(s.Path, pathFilter) {
+			continue
 		}
 		results = append(results, s.SearchResult)
 	}
@@ -1065,7 +1095,7 @@ func hybridSearch(db *sql.DB, queryBlob []byte, ftsQuery string, limit int) ([]S
 }
 
 // searchImages performs hybrid (vector + full-text) search for images based on a query
-func searchImages(db *sql.DB, query, ollamaURL, embeddingModel string) error {
+func searchImages(db *sql.DB, query, ollamaURL, embeddingModel, pathFilter string) error {
 	fmt.Printf("Searching for: %s\n\n", query)
 
 	// Generate embedding for the query
@@ -1079,7 +1109,7 @@ func searchImages(db *sql.DB, query, ollamaURL, embeddingModel string) error {
 		return fmt.Errorf("failed to serialize query embedding: %w", err)
 	}
 
-	results, err := hybridSearch(db, queryBlob, query, 10)
+	results, err := hybridSearch(db, queryBlob, query, 10, pathFilter)
 	if err != nil {
 		return err
 	}
@@ -1100,7 +1130,7 @@ func searchImages(db *sql.DB, query, ollamaURL, embeddingModel string) error {
 }
 
 // findSimilarImages performs similarity search based on an existing image's embedding
-func findSimilarImages(db *sql.DB, imagePath string) error {
+func findSimilarImages(db *sql.DB, imagePath, pathFilter string) error {
 	// Convert to absolute path for DB lookup
 	absPath, err := filepath.Abs(imagePath)
 	if err != nil {
@@ -1148,6 +1178,9 @@ func findSimilarImages(db *sql.DB, imagePath string) error {
 			log.Printf("Error scanning result: %v", err)
 			continue
 		}
+		if pathFilter != "" && !strings.HasPrefix(result.Path, pathFilter) {
+			continue
+		}
 
 		fmt.Printf("File: %s\n", result.Filename)
 		fmt.Printf("Folder: %s\n", result.Foldername)
@@ -1168,7 +1201,7 @@ func findSimilarImages(db *sql.DB, imagePath string) error {
 }
 
 // searchImagesForWeb performs hybrid (vector + full-text) search and returns results
-func searchImagesForWeb(db *sql.DB, query, ollamaURL, embeddingModel string) ([]SearchResult, error) {
+func searchImagesForWeb(db *sql.DB, query, ollamaURL, embeddingModel, pathFilter string) ([]SearchResult, error) {
 	queryEmbedding, err := generateEmbedding(query, ollamaURL, embeddingModel)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate query embedding: %w", err)
@@ -1179,11 +1212,11 @@ func searchImagesForWeb(db *sql.DB, query, ollamaURL, embeddingModel string) ([]
 		return nil, fmt.Errorf("failed to serialize query embedding: %w", err)
 	}
 
-	return hybridSearch(db, queryBlob, query, 25)
+	return hybridSearch(db, queryBlob, query, 25, pathFilter)
 }
 
 // findSimilarImagesForWeb performs similarity search for web interface and returns results
-func findSimilarImagesForWeb(db *sql.DB, imagePath string) ([]SearchResult, error) {
+func findSimilarImagesForWeb(db *sql.DB, imagePath, pathFilter string) ([]SearchResult, error) {
 	// Convert to absolute path for DB lookup
 	absPath, err := filepath.Abs(imagePath)
 	if err != nil {
@@ -1229,6 +1262,9 @@ func findSimilarImagesForWeb(db *sql.DB, imagePath string) ([]SearchResult, erro
 		err = rows.Scan(&result.Filename, &result.Foldername, &result.Path, &result.Description, &result.Distance, &thumbnailBlob)
 		if err != nil {
 			log.Printf("Error scanning result: %v", err)
+			continue
+		}
+		if pathFilter != "" && !strings.HasPrefix(result.Path, pathFilter) {
 			continue
 		}
 		if len(thumbnailBlob) > 0 {
@@ -1405,10 +1441,10 @@ func reindexDatabase(db *sql.DB, ollamaURL, embeddingModel string) error {
 }
 
 // startWebServer starts the HTTP server for web interface
-func startWebServer(db *sql.DB, ollamaURL, embeddingModel string, port int) {
+func startWebServer(db *sql.DB, ollamaURL, embeddingModel string, port int, pathFilter string) {
 	http.HandleFunc("/", handleIndex)
-	http.HandleFunc("/search", makeSearchHandler(db, ollamaURL, embeddingModel))
-	http.HandleFunc("/similar", makeSimilarHandler(db, ollamaURL, embeddingModel))
+	http.HandleFunc("/search", makeSearchHandler(db, ollamaURL, embeddingModel, pathFilter))
+	http.HandleFunc("/similar", makeSimilarHandler(db, ollamaURL, embeddingModel, pathFilter))
 	http.HandleFunc("/image/", makeImageHandler())
 
 	addr := fmt.Sprintf(":%d", port)
@@ -1627,7 +1663,7 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 }
 
 // makeSearchHandler creates a search handler with database and config
-func makeSearchHandler(db *sql.DB, ollamaURL, embeddingModel string) http.HandlerFunc {
+func makeSearchHandler(db *sql.DB, ollamaURL, embeddingModel, pathFilter string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -1640,7 +1676,7 @@ func makeSearchHandler(db *sql.DB, ollamaURL, embeddingModel string) http.Handle
 			return
 		}
 
-		results, err := searchImagesForWeb(db, query, ollamaURL, embeddingModel)
+		results, err := searchImagesForWeb(db, query, ollamaURL, embeddingModel, pathFilter)
 		if err != nil {
 			log.Printf("Search error: %v", err)
 			fmt.Fprintf(w, `<div class="no-results">Error: %s</div>`, err.Error())
@@ -1687,7 +1723,7 @@ func makeSearchHandler(db *sql.DB, ollamaURL, embeddingModel string) http.Handle
 }
 
 // makeSimilarHandler creates a handler for finding similar images
-func makeSimilarHandler(db *sql.DB, ollamaURL, embeddingModel string) http.HandlerFunc {
+func makeSimilarHandler(db *sql.DB, ollamaURL, embeddingModel, pathFilter string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -1700,7 +1736,7 @@ func makeSimilarHandler(db *sql.DB, ollamaURL, embeddingModel string) http.Handl
 			return
 		}
 
-		results, err := findSimilarImagesForWeb(db, imagePath)
+		results, err := findSimilarImagesForWeb(db, imagePath, pathFilter)
 		if err != nil {
 			log.Printf("Similar search error: %v", err)
 			if err.Error() == "image not found in database" {
