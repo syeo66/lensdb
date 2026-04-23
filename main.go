@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
+	"math"
 	"flag"
 	"fmt"
 	"html/template"
@@ -969,6 +971,28 @@ func storeImageDescription(db *sql.DB, imagePath string, description string, emb
 // hybridSearch runs vector search and FTS, merges results with Reciprocal Rank
 // Fusion (k=60), giving FTS matches ftsWeight× the vector weight so that exact
 // word matches surface above purely contextual ones.
+func deserializeFloat32(data []byte) []float32 {
+	n := len(data) / 4
+	out := make([]float32, n)
+	for i := range out {
+		bits := binary.LittleEndian.Uint32(data[i*4:])
+		out[i] = math.Float32frombits(bits)
+	}
+	return out
+}
+
+func dotProduct(a, b []float32) float64 {
+	n := len(a)
+	if len(b) < n {
+		n = len(b)
+	}
+	var sum float64
+	for i := 0; i < n; i++ {
+		sum += float64(a[i]) * float64(b[i])
+	}
+	return sum
+}
+
 func hybridSearch(db *sql.DB, queryBlob []byte, ftsQuery string, limit int, pathFilter string) ([]SearchResult, error) {
 	type entry struct {
 		SearchResult
@@ -978,41 +1002,70 @@ func hybridSearch(db *sql.DB, queryBlob []byte, ftsQuery string, limit int, path
 	const rrfK = 60.0
 	const ftsWeight = 2.0
 
-	// --- Vector search (fetch more than needed so RRF has enough candidates) ---
-	vecSQL := `
-	SELECT
-		img.id,
-		img.filename,
-		img.foldername,
-		img.path,
-		img.description,
-		vec.distance,
-		img.thumbnail
-	FROM vec_descriptions vec
-	INNER JOIN image_descriptions img ON vec.rowid = img.id
-	WHERE vec.embedding MATCH ? AND k = ?
-	ORDER BY vec.distance
-	`
-	vecRows, err := db.Query(vecSQL, queryBlob, limit*5)
-	if err != nil {
-		return nil, fmt.Errorf("vector search failed: %w", err)
-	}
-	defer vecRows.Close()
-
 	var vecEntries []entry
-	for vecRows.Next() {
-		var e entry
-		var thumbnailBlob []byte
-		if err := vecRows.Scan(&e.id, &e.Filename, &e.Foldername, &e.Path, &e.Description, &e.Distance, &thumbnailBlob); err != nil {
+
+	if pathFilter != "" {
+		// In-memory vector search scoped to the path: no k cap applies.
+		// Fetch all images matching the path, rank by dot-product similarity.
+		queryEmbedding := deserializeFloat32(queryBlob)
+		rows, err := db.Query(`
+			SELECT id, filename, foldername, path, description, embedding, thumbnail
+			FROM image_descriptions WHERE path LIKE ?`,
+			pathFilter+"%")
+		if err != nil {
+			return nil, fmt.Errorf("vector search failed: %w", err)
+		}
+		defer rows.Close()
+		type candidate struct {
+			entry
+			score float64
+		}
+		var candidates []candidate
+		for rows.Next() {
+			var e entry
+			var embeddingBlob, thumbnailBlob []byte
+			if err := rows.Scan(&e.id, &e.Filename, &e.Foldername, &e.Path, &e.Description, &embeddingBlob, &thumbnailBlob); err != nil {
+				return nil, err
+			}
+			if len(thumbnailBlob) > 0 {
+				e.Thumbnail = base64.StdEncoding.EncodeToString(thumbnailBlob)
+			}
+			candidates = append(candidates, candidate{entry: e, score: dotProduct(queryEmbedding, deserializeFloat32(embeddingBlob))})
+		}
+		if err := rows.Err(); err != nil {
 			return nil, err
 		}
-		if len(thumbnailBlob) > 0 {
-			e.Thumbnail = base64.StdEncoding.EncodeToString(thumbnailBlob)
+		sort.Slice(candidates, func(i, j int) bool { return candidates[i].score > candidates[j].score })
+		for _, c := range candidates {
+			vecEntries = append(vecEntries, c.entry)
 		}
-		vecEntries = append(vecEntries, e)
-	}
-	if err := vecRows.Err(); err != nil {
-		return nil, err
+	} else {
+		// Global vector search via vec0 virtual table.
+		vecRows, err := db.Query(`
+			SELECT img.id, img.filename, img.foldername, img.path, img.description, vec.distance, img.thumbnail
+			FROM vec_descriptions vec
+			INNER JOIN image_descriptions img ON vec.rowid = img.id
+			WHERE vec.embedding MATCH ? AND k = ?
+			ORDER BY vec.distance`,
+			queryBlob, limit*5)
+		if err != nil {
+			return nil, fmt.Errorf("vector search failed: %w", err)
+		}
+		defer vecRows.Close()
+		for vecRows.Next() {
+			var e entry
+			var thumbnailBlob []byte
+			if err := vecRows.Scan(&e.id, &e.Filename, &e.Foldername, &e.Path, &e.Description, &e.Distance, &thumbnailBlob); err != nil {
+				return nil, err
+			}
+			if len(thumbnailBlob) > 0 {
+				e.Thumbnail = base64.StdEncoding.EncodeToString(thumbnailBlob)
+			}
+			vecEntries = append(vecEntries, e)
+		}
+		if err := vecRows.Err(); err != nil {
+			return nil, err
+		}
 	}
 
 	// --- FTS search (best-effort; fall back to vector-only on error) ---
@@ -1021,15 +1074,23 @@ func hybridSearch(db *sql.DB, queryBlob []byte, ftsQuery string, limit int, path
 	}
 	var ftsEntries []ftsEntry
 
-	ftsSQL := `
-	SELECT img.id
-	FROM fts_descriptions fts
-	JOIN image_descriptions img ON fts.rowid = img.id
-	WHERE fts.description MATCH ?
-	ORDER BY rank
-	LIMIT ?
-	`
-	ftsRows, ftsErr := db.Query(ftsSQL, ftsQuery, limit*5)
+	var ftsRows *sql.Rows
+	var ftsErr error
+	if pathFilter != "" {
+		ftsRows, ftsErr = db.Query(`
+			SELECT img.id FROM fts_descriptions fts
+			JOIN image_descriptions img ON fts.rowid = img.id
+			WHERE fts.description MATCH ? AND img.path LIKE ?
+			ORDER BY rank`,
+			ftsQuery, pathFilter+"%")
+	} else {
+		ftsRows, ftsErr = db.Query(`
+			SELECT img.id FROM fts_descriptions fts
+			JOIN image_descriptions img ON fts.rowid = img.id
+			WHERE fts.description MATCH ?
+			ORDER BY rank LIMIT ?`,
+			ftsQuery, limit*5)
+	}
 	if ftsErr == nil {
 		defer ftsRows.Close()
 		for ftsRows.Next() {
@@ -1085,9 +1146,6 @@ func hybridSearch(db *sql.DB, queryBlob []byte, ftsQuery string, limit int, path
 	for _, s := range combined {
 		if len(results) >= limit {
 			break
-		}
-		if pathFilter != "" && !strings.HasPrefix(s.Path, pathFilter) {
-			continue
 		}
 		results = append(results, s.SearchResult)
 	}
@@ -1148,40 +1206,64 @@ func findSimilarImages(db *sql.DB, imagePath, pathFilter string) error {
 	}
 
 	// Execute vector search with source exclusion
-	searchSQL := `
-		SELECT
-			img.filename,
-			img.foldername,
-			img.path,
-			img.description,
-			vec.distance
-		FROM vec_descriptions vec
-		INNER JOIN image_descriptions img ON vec.rowid = img.id
-		WHERE vec.embedding MATCH ? AND k = 11 AND img.path != ?
-		ORDER BY vec.distance
-	`
-
-	rows, err := db.Query(searchSQL, embeddingBlob, absPath)
-	if err != nil {
-		return fmt.Errorf("failed to search for similar images: %w", err)
-	}
-	defer rows.Close()
-
-	// Print results
 	fmt.Printf("\nImages similar to: %s\n\n", filepath.Base(absPath))
 
-	count := 0
-	for rows.Next() {
-		var result SearchResult
-		err = rows.Scan(&result.Filename, &result.Foldername, &result.Path, &result.Description, &result.Distance)
-		if err != nil {
-			log.Printf("Error scanning result: %v", err)
-			continue
-		}
-		if pathFilter != "" && !strings.HasPrefix(result.Path, pathFilter) {
-			continue
-		}
+	type simResult struct {
+		SearchResult
+		score float64
+	}
 
+	var simResults []simResult
+
+	if pathFilter != "" {
+		// In-memory similarity search within the filtered path — no k cap.
+		sourceEmbedding := deserializeFloat32(embeddingBlob)
+		rows, err := db.Query(`
+			SELECT filename, foldername, path, description, embedding
+			FROM image_descriptions WHERE path LIKE ? AND path != ?`,
+			pathFilter+"%", absPath)
+		if err != nil {
+			return fmt.Errorf("failed to search for similar images: %w", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var r simResult
+			var emb []byte
+			if err := rows.Scan(&r.Filename, &r.Foldername, &r.Path, &r.Description, &emb); err != nil {
+				log.Printf("Error scanning result: %v", err)
+				continue
+			}
+			r.score = dotProduct(sourceEmbedding, deserializeFloat32(emb))
+			simResults = append(simResults, r)
+		}
+		sort.Slice(simResults, func(i, j int) bool { return simResults[i].score > simResults[j].score })
+	} else {
+		rows, err := db.Query(`
+			SELECT img.filename, img.foldername, img.path, img.description, vec.distance
+			FROM vec_descriptions vec
+			INNER JOIN image_descriptions img ON vec.rowid = img.id
+			WHERE vec.embedding MATCH ? AND k = 11 AND img.path != ?
+			ORDER BY vec.distance`,
+			embeddingBlob, absPath)
+		if err != nil {
+			return fmt.Errorf("failed to search for similar images: %w", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var r simResult
+			if err := rows.Scan(&r.Filename, &r.Foldername, &r.Path, &r.Description, &r.Distance); err != nil {
+				log.Printf("Error scanning result: %v", err)
+				continue
+			}
+			simResults = append(simResults, r)
+		}
+	}
+
+	count := 0
+	for _, result := range simResults {
+		if count >= 10 {
+			break
+		}
 		fmt.Printf("File: %s\n", result.Filename)
 		fmt.Printf("Folder: %s\n", result.Foldername)
 		fmt.Printf("Path: %s\n", result.Path)
@@ -1197,7 +1279,7 @@ func findSimilarImages(db *sql.DB, imagePath, pathFilter string) error {
 		fmt.Printf("\nFound %d similar images\n", count)
 	}
 
-	return rows.Err()
+	return nil
 }
 
 // searchImagesForWeb performs hybrid (vector + full-text) search and returns results
@@ -1233,47 +1315,69 @@ func findSimilarImagesForWeb(db *sql.DB, imagePath, pathFilter string) ([]Search
 		return nil, fmt.Errorf("failed to retrieve embedding: %w", err)
 	}
 
-	// Execute vector search with source exclusion
-	searchSQL := `
-		SELECT
-			img.filename,
-			img.foldername,
-			img.path,
-			img.description,
-			vec.distance,
-			img.thumbnail
-		FROM vec_descriptions vec
-		INNER JOIN image_descriptions img ON vec.rowid = img.id
-		WHERE vec.embedding MATCH ? AND k = 26 AND img.path != ?
-		ORDER BY vec.distance
-	`
-
-	rows, err := db.Query(searchSQL, embeddingBlob, absPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to search for similar images: %w", err)
+	type webSimResult struct {
+		SearchResult
+		score float64
 	}
-	defer rows.Close()
 
-	// Build results
-	var results []SearchResult
-	for rows.Next() {
-		var result SearchResult
-		var thumbnailBlob []byte
-		err = rows.Scan(&result.Filename, &result.Foldername, &result.Path, &result.Description, &result.Distance, &thumbnailBlob)
+	var simResults []webSimResult
+
+	if pathFilter != "" {
+		// In-memory similarity search within the filtered path — no k cap.
+		sourceEmbedding := deserializeFloat32(embeddingBlob)
+		rows, err := db.Query(`
+			SELECT filename, foldername, path, description, embedding, thumbnail
+			FROM image_descriptions WHERE path LIKE ? AND path != ?`,
+			pathFilter+"%", absPath)
 		if err != nil {
-			log.Printf("Error scanning result: %v", err)
-			continue
+			return nil, fmt.Errorf("failed to search for similar images: %w", err)
 		}
-		if pathFilter != "" && !strings.HasPrefix(result.Path, pathFilter) {
-			continue
+		defer rows.Close()
+		for rows.Next() {
+			var r webSimResult
+			var emb, thumbnailBlob []byte
+			if err := rows.Scan(&r.Filename, &r.Foldername, &r.Path, &r.Description, &emb, &thumbnailBlob); err != nil {
+				log.Printf("Error scanning result: %v", err)
+				continue
+			}
+			r.score = dotProduct(sourceEmbedding, deserializeFloat32(emb))
+			if len(thumbnailBlob) > 0 {
+				r.Thumbnail = base64.StdEncoding.EncodeToString(thumbnailBlob)
+			}
+			simResults = append(simResults, r)
 		}
-		if len(thumbnailBlob) > 0 {
-			result.Thumbnail = base64.StdEncoding.EncodeToString(thumbnailBlob)
+		sort.Slice(simResults, func(i, j int) bool { return simResults[i].score > simResults[j].score })
+	} else {
+		rows, err := db.Query(`
+			SELECT img.filename, img.foldername, img.path, img.description, vec.distance, img.thumbnail
+			FROM vec_descriptions vec
+			INNER JOIN image_descriptions img ON vec.rowid = img.id
+			WHERE vec.embedding MATCH ? AND k = 26 AND img.path != ?
+			ORDER BY vec.distance`,
+			embeddingBlob, absPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to search for similar images: %w", err)
 		}
-		results = append(results, result)
+		defer rows.Close()
+		for rows.Next() {
+			var r webSimResult
+			var thumbnailBlob []byte
+			if err := rows.Scan(&r.Filename, &r.Foldername, &r.Path, &r.Description, &r.Distance, &thumbnailBlob); err != nil {
+				log.Printf("Error scanning result: %v", err)
+				continue
+			}
+			if len(thumbnailBlob) > 0 {
+				r.Thumbnail = base64.StdEncoding.EncodeToString(thumbnailBlob)
+			}
+			simResults = append(simResults, r)
+		}
 	}
 
-	return results, rows.Err()
+	var results []SearchResult
+	for _, r := range simResults {
+		results = append(results, r.SearchResult)
+	}
+	return results, nil
 }
 
 // cleanupDatabase removes rows from image_descriptions (and the associated vec/fts rows)
@@ -1579,15 +1683,6 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
             line-height: 1.5;
             margin-bottom: 10px;
         }
-        .result-distance {
-            display: inline-block;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            padding: 5px 12px;
-            border-radius: 20px;
-            font-size: 0.85em;
-            font-weight: 600;
-        }
         .no-results {
             background: white;
             border-radius: 12px;
@@ -1704,7 +1799,6 @@ func makeSearchHandler(db *sql.DB, ollamaURL, embeddingModel, pathFilter string)
 					<div class="result-path">%s</div>
 					<div class="result-description">%s</div>
 					<div>
-						<span class="result-distance">distance: %.4f</span>
 						<button class="similar-button" hx-post="/similar" hx-target="#results" hx-vals='{"path": "%s"}'>Find Similar</button>
 					</div>
 				</div>
@@ -1714,7 +1808,6 @@ func makeSearchHandler(db *sql.DB, ollamaURL, embeddingModel, pathFilter string)
 				template.HTMLEscapeString(result.Filename),
 				template.HTMLEscapeString(result.Path),
 				template.HTMLEscapeString(result.Description),
-				result.Distance,
 				template.JSEscapeString(result.Path),
 			)
 		}
@@ -1769,7 +1862,6 @@ func makeSimilarHandler(db *sql.DB, ollamaURL, embeddingModel, pathFilter string
 					<div class="result-path">%s</div>
 					<div class="result-description">%s</div>
 					<div>
-						<span class="result-distance">distance: %.4f</span>
 						<button class="similar-button" hx-post="/similar" hx-target="#results" hx-vals='{"path": "%s"}'>Find Similar</button>
 					</div>
 				</div>
@@ -1779,7 +1871,6 @@ func makeSimilarHandler(db *sql.DB, ollamaURL, embeddingModel, pathFilter string
 				template.HTMLEscapeString(result.Filename),
 				template.HTMLEscapeString(result.Path),
 				template.HTMLEscapeString(result.Description),
-				result.Distance,
 				template.JSEscapeString(result.Path),
 			)
 		}
