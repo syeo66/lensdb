@@ -240,13 +240,13 @@ sqlite3 ~/.lensdb.db "SELECT filename, description FROM image_descriptions;"
 
 ## Dependencies
 
-- **github.com/mattn/go-sqlite3** (v1.14.34): SQLite database driver (CGO)
+- **github.com/mattn/go-sqlite3** (v1.14.52): SQLite database driver (CGO)
 - **github.com/asg017/sqlite-vec-go-bindings** (v0.1.6): SQLite vector search extension
-- **golang.org/x/image** (v0.36.0): Image processing and WebP support
+- **golang.org/x/image** (v0.47.0): Image processing and WebP support
 
 ### System Requirements
 
-- Go 1.24.0 or higher
+- Go 1.26.0 or higher
 - CGO enabled (required for SQLite compilation)
 - Ollama running locally or on a remote server
 - Anthropic API key only required with `-use-anthropic`
