@@ -6,7 +6,6 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
-	"math"
 	"flag"
 	"fmt"
 	"html/template"
@@ -16,11 +15,14 @@ import (
 	"image/png"
 	"io"
 	"log"
+	"math"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	sqlite_vec "github.com/asg017/sqlite-vec-go-bindings/cgo"
@@ -115,6 +117,7 @@ func main() {
 	var searchQuery string
 	var webMode bool
 	var port int
+	var host string
 	var similarImage string
 	var reindex bool
 	var cleanup bool
@@ -131,12 +134,13 @@ func main() {
 	flag.StringVar(&dbPath, "db", defaultDB, "Path to SQLite database file")
 	flag.StringVar(&apiKey, "api-key", "", "Anthropic API key (or set ANTHROPIC_API_KEY env var, only needed with -use-anthropic)")
 	flag.StringVar(&ollamaURL, "ollama-url", "", "Ollama server URL (or set OLLAMA_URL env var, default: http://localhost:11434)")
-	flag.StringVar(&embeddingModel, "embedding-model", "", "Ollama embedding model (or set OLLAMA_EMBEDDING_MODEL env var, default: nomic-embed-text)")
+	flag.StringVar(&embeddingModel, "embedding-model", "", "Ollama embedding model (or set OLLAMA_EMBEDDING_MODEL env var, default: bge-m3)")
 	flag.StringVar(&visionModel, "vision-model", "", "Ollama vision model for image descriptions (or set OLLAMA_VISION_MODEL env var, default: qwen3-vl:8b)")
 	flag.BoolVar(&useAnthropic, "use-anthropic", false, "Use Anthropic Claude for image descriptions instead of Ollama vision model")
 	flag.StringVar(&searchQuery, "search", "", "Search for images by description (semantic search)")
 	flag.BoolVar(&webMode, "web", false, "Start web interface for searching images")
 	flag.IntVar(&port, "port", 8080, "Port for web interface (default: 8080)")
+	flag.StringVar(&host, "host", "localhost", "Interface for the web server to listen on (use 0.0.0.0 to allow access from other machines)")
 	flag.StringVar(&similarImage, "similar", "", "Find images similar to the given image path")
 	flag.BoolVar(&reindex, "reindex", false, "Rebuild the vector and full-text search indexes from existing descriptions")
 	flag.BoolVar(&cleanup, "cleanup", false, "Remove database entries for image files that no longer exist on disk")
@@ -144,7 +148,7 @@ func main() {
 	flag.BoolVar(&replace, "replace", false, "Re-process and overwrite descriptions for images already in the database")
 
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: lensdb [flags] [image-folder [db-path]]\n\n")
+		fmt.Fprintf(os.Stderr, "Usage: lensdb [flags] [image-folder]\n\n")
 
 		fmt.Fprintf(os.Stderr, "Modes (default: process image-folder):\n")
 		for _, name := range []string{"search", "similar", "web", "reindex", "cleanup"} {
@@ -183,13 +187,13 @@ func main() {
 		}
 
 		fmt.Fprintf(os.Stderr, "\nWeb server:\n")
-		for _, name := range []string{"port"} {
+		for _, name := range []string{"host", "port"} {
 			f := flag.Lookup(name)
 			fmt.Fprintf(os.Stderr, "  -%s\t%s\n", f.Name, f.Usage)
 		}
 	}
 
-	flag.Parse()
+	positional := parseArgs(flag.CommandLine, os.Args[1:])
 
 	// Normalize pathFilter to an absolute path with trailing separator so
 	// strings.HasPrefix correctly scopes matches to that directory.
@@ -245,8 +249,8 @@ func main() {
 				"Details: %v", ollamaURL, embeddingModel, err)
 		}
 
-		fmt.Printf("Starting web server on http://localhost:%d\n", port)
-		startWebServer(db, ollamaURL, embeddingModel, port, pathFilter)
+		fmt.Printf("Starting web server on http://%s\n", net.JoinHostPort(host, strconv.Itoa(port)))
+		startWebServer(db, ollamaURL, embeddingModel, host, port, pathFilter)
 		return
 	}
 
@@ -290,38 +294,18 @@ func main() {
 
 	// Handle cleanup mode
 	if cleanup {
-		if err := cleanupDatabase(db); err != nil {
+		if err := cleanupDatabase(db, os.Stdin); err != nil {
 			log.Fatalf("Failed to clean up database: %v", err)
 		}
 		return
 	}
 
 	// Handle process mode
-	if len(flag.Args()) == 0 {
-		log.Fatal("Usage: lensdb [options] <folder-path>\n" +
-			"  or:  lensdb -search \"query\" [options]\n" +
-			"  or:  lensdb -similar \"/path/to/image.jpg\" [options]\n" +
-			"  or:  lensdb -web [options]\n" +
-			"  or:  lensdb -reindex [options]\n\n" +
-			"Options:\n" +
-			"  -db              Path to SQLite database file\n" +
-			"  -ollama-url      Ollama server URL (or set OLLAMA_URL env var)\n" +
-			"  -embedding-model Ollama embedding model (or set OLLAMA_EMBEDDING_MODEL env var)\n" +
-			"  -vision-model    Ollama vision model for descriptions (or set OLLAMA_VISION_MODEL env var)\n" +
-			"  -use-anthropic   Use Anthropic Claude for image descriptions instead of Ollama\n" +
-			"  -api-key         Anthropic API key (or set ANTHROPIC_API_KEY env var, only with -use-anthropic)\n" +
-			"  -search          Search for images by description\n" +
-			"  -similar         Find images similar to the specified image\n" +
-			"  -web             Start web interface for searching images\n" +
-			"  -port            Port for web interface (default: 8080)\n" +
-			"  -reindex         Rebuild vector and full-text search indexes from existing descriptions\n\n" +
-			"Environment Variables:\n" +
-			"  OLLAMA_URL              Ollama server URL (default: http://localhost:11434)\n" +
-			"  OLLAMA_EMBEDDING_MODEL  Embedding model name (default: nomic-embed-text)\n" +
-			"  OLLAMA_VISION_MODEL     Vision model for descriptions (default: qwen3-vl:8b)\n" +
-			"  ANTHROPIC_API_KEY       Anthropic API key (only needed with -use-anthropic)")
+	if len(positional) == 0 {
+		flag.Usage()
+		os.Exit(2)
 	}
-	folderPath := flag.Args()[0]
+	folderPath := positional[0]
 
 	// Verify Ollama embedding API is available before processing
 	if err := verifyOllamaAPI(ollamaURL, embeddingModel); err != nil {
@@ -356,6 +340,19 @@ func main() {
 	}
 
 	fmt.Println("Successfully processed all images")
+}
+
+// parseArgs parses fs and returns the positional arguments. flag stops at the
+// first positional argument; keep parsing so flags may also follow the image
+// folder (e.g. `lensdb ~/Pictures -db custom.db`).
+func parseArgs(fs *flag.FlagSet, args []string) []string {
+	fs.Parse(args)
+	var positional []string
+	for rest := fs.Args(); len(rest) > 0; rest = fs.Args() {
+		positional = append(positional, rest[0])
+		fs.Parse(rest[1:])
+	}
+	return positional
 }
 
 func initDatabase(dbPath string) (*sql.DB, error) {
@@ -424,6 +421,15 @@ func initDatabase(dbPath string) (*sql.DB, error) {
 	if ftsCount == 0 {
 		_, _ = db.Exec(`INSERT INTO fts_descriptions(rowid, description) SELECT id, description FROM image_descriptions`)
 	}
+
+	// Remove index rows orphaned by earlier versions, whose -replace re-assigned
+	// row ids without deleting the old vector entry.
+	if res, err := db.Exec(`DELETE FROM vec_descriptions WHERE rowid NOT IN (SELECT id FROM image_descriptions)`); err != nil {
+		log.Printf("Warning: failed to remove orphaned vector entries: %v", err)
+	} else if n, _ := res.RowsAffected(); n > 0 {
+		log.Printf("Removed %d orphaned vector entries.", n)
+	}
+	_, _ = db.Exec(`DELETE FROM fts_descriptions WHERE rowid NOT IN (SELECT id FROM image_descriptions)`)
 
 	return db, nil
 }
@@ -924,44 +930,46 @@ func storeImageDescription(db *sql.DB, imagePath string, description string, emb
 	}
 	defer tx.Rollback()
 
-	// If a row for this path already exists, delete its FTS entry first (INSERT OR
-	// REPLACE re-assigns the autoincrement id, which would orphan the old rowid).
-	var oldID int64
-	if err := tx.QueryRow("SELECT id FROM image_descriptions WHERE path = ?", absPath).Scan(&oldID); err == nil {
-		_, _ = tx.Exec("DELETE FROM fts_descriptions WHERE rowid = ?", oldID)
+	// Update in place when the path is already indexed so the row id stays
+	// stable; the vec and fts tables are keyed by that id.
+	var rowID int64
+	err = tx.QueryRow("SELECT id FROM image_descriptions WHERE path = ?", absPath).Scan(&rowID)
+	switch {
+	case err == sql.ErrNoRows:
+		result, err := tx.Exec(`
+		INSERT INTO image_descriptions (filename, foldername, path, description, embedding, thumbnail)
+		VALUES (?, ?, ?, ?, ?, ?)`,
+			filename, foldername, absPath, description, embeddingBlob, thumbnail)
+		if err != nil {
+			return err
+		}
+		if rowID, err = result.LastInsertId(); err != nil {
+			return err
+		}
+	case err != nil:
+		return err
+	default:
+		_, err = tx.Exec(`
+		UPDATE image_descriptions
+		SET filename = ?, foldername = ?, description = ?, embedding = ?, thumbnail = ?
+		WHERE id = ?`,
+			filename, foldername, description, embeddingBlob, thumbnail, rowID)
+		if err != nil {
+			return err
+		}
 	}
 
-	// Insert or replace in main table
-	insertSQL := `
-	INSERT OR REPLACE INTO image_descriptions (filename, foldername, path, description, embedding, thumbnail)
-	VALUES (?, ?, ?, ?, ?, ?)
-	`
-
-	result, err := tx.Exec(insertSQL, filename, foldername, absPath, description, embeddingBlob, thumbnail)
-	if err != nil {
+	// Replace vector and FTS entries (rowid must match)
+	if _, err = tx.Exec("DELETE FROM vec_descriptions WHERE rowid = ?", rowID); err != nil {
 		return err
 	}
-
-	// Get the row ID
-	rowID, err := result.LastInsertId()
-	if err != nil {
+	if _, err = tx.Exec("INSERT INTO vec_descriptions (rowid, embedding) VALUES (?, ?)", rowID, embeddingBlob); err != nil {
 		return err
 	}
-
-	// Insert or replace in vector table (rowid must match)
-	vecInsertSQL := `
-	INSERT OR REPLACE INTO vec_descriptions (rowid, embedding)
-	VALUES (?, ?)
-	`
-
-	_, err = tx.Exec(vecInsertSQL, rowID, embeddingBlob)
-	if err != nil {
+	if _, err = tx.Exec("DELETE FROM fts_descriptions WHERE rowid = ?", rowID); err != nil {
 		return err
 	}
-
-	// Insert into FTS table (rowid must match)
-	_, err = tx.Exec("INSERT INTO fts_descriptions(rowid, description) VALUES(?, ?)", rowID, description)
-	if err != nil {
+	if _, err = tx.Exec("INSERT INTO fts_descriptions(rowid, description) VALUES(?, ?)", rowID, description); err != nil {
 		return err
 	}
 
@@ -971,6 +979,12 @@ func storeImageDescription(db *sql.DB, imagePath string, description string, emb
 // hybridSearch runs vector search and FTS, merges results with Reciprocal Rank
 // Fusion (k=60), giving FTS matches ftsWeight× the vector weight so that exact
 // word matches surface above purely contextual ones.
+// likePrefix returns a LIKE pattern (used with ESCAPE '!') matching strings
+// that start with prefix, so "_" and "%" in paths are matched literally.
+func likePrefix(prefix string) string {
+	return strings.NewReplacer("!", "!!", "%", "!%", "_", "!_").Replace(prefix) + "%"
+}
+
 func deserializeFloat32(data []byte) []float32 {
 	n := len(data) / 4
 	out := make([]float32, n)
@@ -1010,8 +1024,8 @@ func hybridSearch(db *sql.DB, queryBlob []byte, ftsQuery string, limit int, path
 		queryEmbedding := deserializeFloat32(queryBlob)
 		rows, err := db.Query(`
 			SELECT id, filename, foldername, path, description, embedding, thumbnail
-			FROM image_descriptions WHERE path LIKE ?`,
-			pathFilter+"%")
+			FROM image_descriptions WHERE path LIKE ? ESCAPE '!'`,
+			likePrefix(pathFilter))
 		if err != nil {
 			return nil, fmt.Errorf("vector search failed: %w", err)
 		}
@@ -1080,9 +1094,9 @@ func hybridSearch(db *sql.DB, queryBlob []byte, ftsQuery string, limit int, path
 		ftsRows, ftsErr = db.Query(`
 			SELECT img.id FROM fts_descriptions fts
 			JOIN image_descriptions img ON fts.rowid = img.id
-			WHERE fts.description MATCH ? AND img.path LIKE ?
+			WHERE fts.description MATCH ? AND img.path LIKE ? ESCAPE '!'
 			ORDER BY rank`,
-			ftsQuery, pathFilter+"%")
+			ftsQuery, likePrefix(pathFilter))
 	} else {
 		ftsRows, ftsErr = db.Query(`
 			SELECT img.id FROM fts_descriptions fts
@@ -1220,8 +1234,8 @@ func findSimilarImages(db *sql.DB, imagePath, pathFilter string) error {
 		sourceEmbedding := deserializeFloat32(embeddingBlob)
 		rows, err := db.Query(`
 			SELECT filename, foldername, path, description, embedding
-			FROM image_descriptions WHERE path LIKE ? AND path != ?`,
-			pathFilter+"%", absPath)
+			FROM image_descriptions WHERE path LIKE ? ESCAPE '!' AND path != ?`,
+			likePrefix(pathFilter), absPath)
 		if err != nil {
 			return fmt.Errorf("failed to search for similar images: %w", err)
 		}
@@ -1327,8 +1341,8 @@ func findSimilarImagesForWeb(db *sql.DB, imagePath, pathFilter string) ([]Search
 		sourceEmbedding := deserializeFloat32(embeddingBlob)
 		rows, err := db.Query(`
 			SELECT filename, foldername, path, description, embedding, thumbnail
-			FROM image_descriptions WHERE path LIKE ? AND path != ?`,
-			pathFilter+"%", absPath)
+			FROM image_descriptions WHERE path LIKE ? ESCAPE '!' AND path != ?`,
+			likePrefix(pathFilter), absPath)
 		if err != nil {
 			return nil, fmt.Errorf("failed to search for similar images: %w", err)
 		}
@@ -1382,7 +1396,7 @@ func findSimilarImagesForWeb(db *sql.DB, imagePath, pathFilter string) ([]Search
 
 // cleanupDatabase removes rows from image_descriptions (and the associated vec/fts rows)
 // where the file no longer exists on disk.
-func cleanupDatabase(db *sql.DB) error {
+func cleanupDatabase(db *sql.DB, confirm io.Reader) error {
 	rows, err := db.Query(`SELECT id, path FROM image_descriptions ORDER BY id`)
 	if err != nil {
 		return fmt.Errorf("querying paths: %w", err)
@@ -1412,24 +1426,102 @@ func cleanupDatabase(db *sql.DB) error {
 	}
 	fmt.Printf("Checking %d entries...\n", total)
 
+	// Files missing from a folder that still exists were deleted and are removed
+	// right away. Entries whose whole folder is gone usually mean an unmounted
+	// drive, so those are only removed after confirmation.
 	removed := 0
+	var inMissingDirs []entry
+	missingDirs := make(map[string]int)
 	for i, e := range entries {
 		fmt.Printf("\r[%d/%d] checking...", i+1, total)
-		if _, err := os.Stat(e.path); err == nil {
+		_, err := os.Stat(e.path)
+		if err == nil {
 			continue
 		}
-		if _, err := db.Exec(`DELETE FROM image_descriptions WHERE id = ?`, e.id); err != nil {
+		if !os.IsNotExist(err) {
+			fmt.Println()
+			log.Printf("Skipping %s: %v", e.path, err)
+			continue
+		}
+		if _, err := os.Stat(filepath.Dir(e.path)); err != nil {
+			inMissingDirs = append(inMissingDirs, e)
+			missingDirs[topmostMissingDir(e.path)]++
+			continue
+		}
+		if err := deleteEntry(db, e.id); err != nil {
 			fmt.Println()
 			log.Printf("Failed to delete row %d (%s): %v", e.id, e.path, err)
 			continue
 		}
-		db.Exec(`DELETE FROM vec_descriptions WHERE rowid = ?`, e.id)
-		db.Exec(`DELETE FROM fts_descriptions WHERE rowid = ?`, e.id)
 		fmt.Printf("\r✗ Removed: %s\n", e.path)
 		removed++
 	}
-	fmt.Printf("\rCleanup complete: removed %d of %d entries.\n", removed, total)
+	fmt.Println()
+
+	if len(inMissingDirs) > 0 {
+		dirs := make([]string, 0, len(missingDirs))
+		for d := range missingDirs {
+			dirs = append(dirs, d)
+		}
+		sort.Strings(dirs)
+		fmt.Printf("%d entries are in folders that no longer exist:\n", len(inMissingDirs))
+		for _, d := range dirs {
+			fmt.Printf("  %s (%d entries)\n", d, missingDirs[d])
+		}
+		fmt.Print("If these are on a drive that isn't mounted, answer no. Remove them? [y/N] ")
+		var answer string
+		fmt.Fscanln(confirm, &answer)
+		if strings.EqualFold(answer, "y") || strings.EqualFold(answer, "yes") {
+			for _, e := range inMissingDirs {
+				if err := deleteEntry(db, e.id); err != nil {
+					log.Printf("Failed to delete row %d (%s): %v", e.id, e.path, err)
+					continue
+				}
+				fmt.Printf("✗ Removed: %s\n", e.path)
+				removed++
+			}
+		} else {
+			fmt.Println("Kept entries in missing folders.")
+		}
+	}
+
+	fmt.Printf("Cleanup complete: removed %d of %d entries.\n", removed, total)
 	return nil
+}
+
+// topmostMissingDir returns the highest ancestor directory of path that doesn't
+// exist, e.g. /Volumes/Photos when that drive isn't mounted.
+func topmostMissingDir(path string) string {
+	missing := filepath.Dir(path)
+	for {
+		parent := filepath.Dir(missing)
+		if parent == missing {
+			return missing
+		}
+		if _, err := os.Stat(parent); err == nil {
+			return missing
+		}
+		missing = parent
+	}
+}
+
+// deleteEntry removes an image row and its vector and FTS entries atomically.
+func deleteEntry(db *sql.DB, id int64) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, q := range []string{
+		`DELETE FROM image_descriptions WHERE id = ?`,
+		`DELETE FROM vec_descriptions WHERE rowid = ?`,
+		`DELETE FROM fts_descriptions WHERE rowid = ?`,
+	} {
+		if _, err := tx.Exec(q, id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // reindexDatabase regenerates embeddings for every row and rebuilds vec_descriptions
@@ -1545,14 +1637,13 @@ func reindexDatabase(db *sql.DB, ollamaURL, embeddingModel string) error {
 }
 
 // startWebServer starts the HTTP server for web interface
-func startWebServer(db *sql.DB, ollamaURL, embeddingModel string, port int, pathFilter string) {
+func startWebServer(db *sql.DB, ollamaURL, embeddingModel, host string, port int, pathFilter string) {
 	http.HandleFunc("/", handleIndex)
 	http.HandleFunc("/search", makeSearchHandler(db, ollamaURL, embeddingModel, pathFilter))
 	http.HandleFunc("/similar", makeSimilarHandler(db, ollamaURL, embeddingModel, pathFilter))
-	http.HandleFunc("/image/", makeImageHandler())
+	http.HandleFunc("/image/", makeImageHandler(db))
 
-	addr := fmt.Sprintf(":%d", port)
-	log.Fatal(http.ListenAndServe(addr, nil))
+	log.Fatal(http.ListenAndServe(net.JoinHostPort(host, strconv.Itoa(port)), nil))
 }
 
 // handleIndex serves the main HTML page
@@ -1774,44 +1865,16 @@ func makeSearchHandler(db *sql.DB, ollamaURL, embeddingModel, pathFilter string)
 		results, err := searchImagesForWeb(db, query, ollamaURL, embeddingModel, pathFilter)
 		if err != nil {
 			log.Printf("Search error: %v", err)
-			fmt.Fprintf(w, `<div class="no-results">Error: %s</div>`, err.Error())
+			renderMessage(w, "Error: "+err.Error())
 			return
 		}
 
 		if len(results) == 0 {
-			fmt.Fprint(w, `<div class="no-results">No results found. Try a different query.</div>`)
+			renderMessage(w, "No results found. Try a different query.")
 			return
 		}
 
-		// Render results
-		w.Header().Set("Content-Type", "text/html")
-		fmt.Fprint(w, `<div class="results">`)
-		for _, result := range results {
-			imgSrc := "/image/?path=" + url.QueryEscape(result.Path)
-			if result.Thumbnail != "" {
-				imgSrc = "data:image/jpeg;base64," + result.Thumbnail
-			}
-			fmt.Fprintf(w, `
-			<div class="result-card">
-				<img src="%s" alt="%s" class="result-image" loading="lazy">
-				<div class="result-content">
-					<div class="result-filename">%s</div>
-					<div class="result-path">%s</div>
-					<div class="result-description">%s</div>
-					<div>
-						<button class="similar-button" hx-post="/similar" hx-target="#results" hx-vals='{"path": "%s"}'>Find Similar</button>
-					</div>
-				</div>
-			</div>`,
-				imgSrc,
-				template.HTMLEscapeString(result.Filename),
-				template.HTMLEscapeString(result.Filename),
-				template.HTMLEscapeString(result.Path),
-				template.HTMLEscapeString(result.Description),
-				template.JSEscapeString(result.Path),
-			)
-		}
-		fmt.Fprint(w, `</div>`)
+		renderResults(w, results)
 	}
 }
 
@@ -1833,58 +1896,87 @@ func makeSimilarHandler(db *sql.DB, ollamaURL, embeddingModel, pathFilter string
 		if err != nil {
 			log.Printf("Similar search error: %v", err)
 			if err.Error() == "image not found in database" {
-				fmt.Fprint(w, `<div class="no-results">This image is not in the database.</div>`)
+				renderMessage(w, "This image is not in the database.")
 			} else {
-				fmt.Fprintf(w, `<div class="no-results">Error: %s</div>`, template.HTMLEscapeString(err.Error()))
+				renderMessage(w, "Error: "+err.Error())
 			}
 			return
 		}
 
 		if len(results) == 0 {
-			fmt.Fprint(w, `<div class="no-results">No similar images found.</div>`)
+			renderMessage(w, "No similar images found.")
 			return
 		}
 
-		// Render results using same HTML structure as search
-		w.Header().Set("Content-Type", "text/html")
-		fmt.Fprint(w, `<div class="results">`)
-
-		for _, result := range results {
-			imgSrc := "/image/?path=" + url.QueryEscape(result.Path)
-			if result.Thumbnail != "" {
-				imgSrc = "data:image/jpeg;base64," + result.Thumbnail
-			}
-			fmt.Fprintf(w, `
-			<div class="result-card">
-				<img src="%s" alt="%s" class="result-image" loading="lazy">
-				<div class="result-content">
-					<div class="result-filename">%s</div>
-					<div class="result-path">%s</div>
-					<div class="result-description">%s</div>
-					<div>
-						<button class="similar-button" hx-post="/similar" hx-target="#results" hx-vals='{"path": "%s"}'>Find Similar</button>
-					</div>
-				</div>
-			</div>`,
-				imgSrc,
-				template.HTMLEscapeString(result.Filename),
-				template.HTMLEscapeString(result.Filename),
-				template.HTMLEscapeString(result.Path),
-				template.HTMLEscapeString(result.Description),
-				template.JSEscapeString(result.Path),
-			)
-		}
-
-		fmt.Fprint(w, `</div>`)
+		renderResults(w, results)
 	}
 }
 
-// makeImageHandler creates a handler that serves image files
-func makeImageHandler() http.HandlerFunc {
+// resultsTemplate renders search/similar results. html/template escapes every
+// value for its context, so filenames containing quotes can't break the markup.
+var resultsTemplate = template.Must(template.New("results").Parse(`<div class="results">
+{{- range .}}
+	<div class="result-card">
+		<img src="{{.ImgSrc}}" alt="{{.Filename}}" class="result-image" loading="lazy">
+		<div class="result-content">
+			<div class="result-filename">{{.Filename}}</div>
+			<div class="result-path">{{.Path}}</div>
+			<div class="result-description">{{.Description}}</div>
+			<div>
+				<button class="similar-button" hx-post="/similar" hx-target="#results" hx-vals="{{.Vals}}">Find Similar</button>
+			</div>
+		</div>
+	</div>
+{{- end}}
+</div>`))
+
+var messageTemplate = template.Must(template.New("message").Parse(`<div class="no-results">{{.}}</div>`))
+
+func renderResults(w http.ResponseWriter, results []SearchResult) {
+	type view struct {
+		SearchResult
+		ImgSrc template.URL
+		Vals   string
+	}
+	views := make([]view, 0, len(results))
+	for _, r := range results {
+		imgSrc := "/image/?path=" + url.QueryEscape(r.Path)
+		if r.Thumbnail != "" {
+			imgSrc = "data:image/jpeg;base64," + r.Thumbnail
+		}
+		vals, _ := json.Marshal(map[string]string{"path": r.Path})
+		views = append(views, view{SearchResult: r, ImgSrc: template.URL(imgSrc), Vals: string(vals)})
+	}
+	w.Header().Set("Content-Type", "text/html")
+	if err := resultsTemplate.Execute(w, views); err != nil {
+		log.Printf("Render error: %v", err)
+	}
+}
+
+func renderMessage(w http.ResponseWriter, msg string) {
+	w.Header().Set("Content-Type", "text/html")
+	if err := messageTemplate.Execute(w, msg); err != nil {
+		log.Printf("Render error: %v", err)
+	}
+}
+
+// makeImageHandler creates a handler that serves indexed image files. Only paths
+// present in the database are served, so the endpoint can't read arbitrary files.
+func makeImageHandler(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		imagePath := r.URL.Query().Get("path")
 		if imagePath == "" {
 			http.Error(w, "Path parameter required", http.StatusBadRequest)
+			return
+		}
+
+		exists, err := imageExistsInDB(db, imagePath)
+		if err != nil {
+			http.Error(w, "Database error", http.StatusInternalServerError)
+			return
+		}
+		if !exists {
+			http.Error(w, "Image not found", http.StatusNotFound)
 			return
 		}
 

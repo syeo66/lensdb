@@ -1,4 +1,4 @@
-.PHONY: all build install clean
+.PHONY: all build test install clean
 
 BINARY_NAME=lensdb
 INSTALL_DIR=$(HOME)/bin
@@ -7,6 +7,9 @@ all: build
 
 build:
 	go build -tags fts5 -o $(BINARY_NAME)
+
+test:
+	go test -tags fts5 ./...
 
 install: build
 	mkdir -p $(INSTALL_DIR)

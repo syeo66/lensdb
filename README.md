@@ -9,6 +9,8 @@ go mod download
 make
 ```
 
+Run the tests with `make test`.
+
 > **Note:** Build via `make` (or `go build -tags fts5`) to enable full-text search. A plain `go build` omits fts5 support.
 
 ## Usage
@@ -87,9 +89,14 @@ The image must already be indexed. Run lensdb on its folder first if it isn't.
 
 # With custom database and Ollama configuration
 ./lensdb -web -port 3000 -db custom.db -ollama-url http://192.168.1.100:11434
+
+# Allow access from other machines on your network
+./lensdb -web -host 0.0.0.0
 ```
 
 Open `http://localhost:8080` (or your specified port) to search interactively. Each result has a "Find Similar" button.
+
+The server listens on `localhost` only by default. Full-size images are served only for paths that are indexed in the database.
 
 ### Reindexing
 
@@ -117,9 +124,11 @@ Remove database entries for image files that no longer exist on disk. Useful aft
 
 Displays a live `[n/total]` progress counter while checking, prints each removed path, and finishes with a summary.
 
+Entries for files deleted from a folder that still exists are removed right away. If an entry's whole folder is missing (for example, because an external drive isn't mounted), cleanup lists those folders and asks before removing their entries.
+
 ## Flags
 
-Command-line flags override environment variables:
+Flags can go before or after the image folder. Command-line flags override environment variables:
 
 - `-db`: Path to SQLite database file (default: `~/.lensdb.db`)
 - `-ollama-url`: Ollama server URL (env: `OLLAMA_URL`, default: `http://localhost:11434`)
@@ -131,8 +140,11 @@ Command-line flags override environment variables:
 - `-similar`: Find images similar to the specified image path
 - `-web`: Start web interface for interactive searching
 - `-port`: Port for web interface (default: `8080`)
+- `-host`: Interface for the web server to listen on (default: `localhost`; use `0.0.0.0` for network access)
 - `-reindex`: Rebuild vector and full-text search indexes from existing descriptions
 - `-cleanup`: Remove database entries for image files that no longer exist on disk
+- `-path`: Restrict search/similar results to images within this directory
+- `-replace`: Re-process and overwrite descriptions for images already in the database
 
 ## Supported Image Formats
 
